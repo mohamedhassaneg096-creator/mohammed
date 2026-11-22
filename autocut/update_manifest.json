@@ -1,0 +1,32 @@
+{
+  "managed_paths": [
+    "app/",
+    "web/",
+    "migrations/",
+    "VERSION",
+    "CHANGELOG.md",
+    "requirements.txt",
+    "install.bat",
+    "run.bat",
+    "launcher.py",
+    "create_shortcut.bat",
+    "README.md",
+    "update_manifest.json"
+  ],
+  "ignore_patterns": [
+    "src/",
+    "public/",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "vite.config.*",
+    "node_modules/",
+    ".git/",
+    ".github/",
+    "docs/",
+    "tests/",
+    "__pycache__/",
+    "*.pyc",
+    "*.pyo"
+  ]
+}

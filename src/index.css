@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --bg-app: #0F1115;
+  --bg-surface: #171A21;
+  --bg-raised: #1E222B;
+  --border: #2A2F3A;
+  --text-primary: #E8EAF0;
+  --text-muted: #9AA3B2;
+  --accent: #5B8CFF;
+}
+
+[data-theme="light"] {
+  --bg-app: #F4F6FA;
+  --bg-surface: #FFFFFF;
+  --bg-raised: #F8FAFC;
+  --border: #DCE2EC;
+  --text-primary: #141821;
+  --text-muted: #525D70;
+  --accent: #3B6FE8;
+}
+
+body {
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+  font-family: "IBM Plex Sans Arabic", "Segoe UI", Tahoma, sans-serif;
+  direction: rtl;
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes dotPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 5px rgba(91, 140, 255, 0.34), 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 11px rgba(91, 140, 255, 0.12), 0 4px 12px rgba(0, 0, 0, 0.5);
+  }
+}
+
+.focus-dot-pulse {
+  animation: dotPulse 1.8s ease-in-out infinite;
+}

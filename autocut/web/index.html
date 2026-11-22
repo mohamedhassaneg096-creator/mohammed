@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>أوتوكَت | AutoCut — تجميع الفيديو التلقائي</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Top Bar -->
+    <header class="topbar">
+      <div class="topbar-brand" id="btn-go-home" role="button" tabindex="0" title="العودة إلى قائمة المشاريع">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="4" width="20" height="16" rx="2"/>
+            <path d="M10 4v16"/>
+            <path d="M2 12h20"/>
+          </svg>
+        </span>
+        <span class="brand-title">أوتوكَت · AutoCut</span>
+        <span id="app-version-tag" class="version-tag mono">v1.1.0</span>
+      </div>
+
+      <div class="topbar-center">
+        <span id="top-project-name" class="project-name-label hidden"></span>
+        <span id="top-save-status" class="save-indicator hidden">تم الحفظ ✓</span>
+        <button class="update-badge hidden" id="btn-update-badge" title="انقر لعرض تفاصيل التحديث المتاح"></button>
+      </div>
+
+      <div class="topbar-actions">
+        <button class="btn btn-sm" id="btn-open-updates" title="فحص التحديثات وإعدادات المصدر">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          التحديثات
+        </button>
+        <button class="btn btn-sm btn-ghost" id="btn-copy-report" title="نسخ تقرير المشكلة بدون أي رموز سرية">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+          تقرير المشكلة
+        </button>
+        <button class="btn btn-sm btn-ghost" id="btn-open-log" title="فتح ملف السجل">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          السجل
+        </button>
+        <button class="btn btn-sm btn-ghost" id="btn-toggle-theme" title="تبديل المظهر">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+          المظهر
+        </button>
+        <button class="btn btn-sm" id="btn-open-settings">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          الإعدادات
+        </button>
+      </div>
+    </header>
+
+    <!-- Horizontal Stepper -->
+    <nav id="stepper-bar" class="stepper-bar hidden" aria-label="مراحل العمل">
+      <div class="stepper-list">
+        <button class="step-btn" data-stage="inputs"><span class="step-num tabular">1</span>المدخلات</button>
+        <span class="step-arrow">←</span>
+        <button class="step-btn" data-stage="cuts"><span class="step-num tabular">2</span>التفريغ والقص</button>
+        <span class="step-arrow">←</span>
+        <button class="step-btn" data-stage="scenes"><span class="step-num tabular">3</span>المشاهد</button>
+        <span class="step-arrow">←</span>
+        <button class="step-btn" data-stage="motion"><span class="step-num tabular">4</span>الحركات</button>
+        <span class="step-arrow">←</span>
+        <button class="step-btn" data-stage="export"><span class="step-num tabular">5</span>التصدير</button>
+        <span class="step-arrow hidden" id="review-step-arrow">←</span>
+        <button class="step-btn hidden" id="review-step-btn" data-stage="review"><span class="step-num tabular">6</span>مراجعة وتعديل</button>
+      </div>
+    </nav>
+
+    <!-- Main Container -->
+    <main class="main-content">
+      <!-- Post-Update Result Banner -->
+      <div id="update-result-banner" class="alert alert-success hidden">
+        <div>
+          <strong id="update-result-title">تم التحديث</strong>
+          <div id="update-result-body"></div>
+        </div>
+        <button class="btn btn-sm" id="btn-dismiss-update-result">إغلاق</button>
+      </div>
+
+      <!-- FFmpeg / System Health Error Banner -->
+      <div id="system-error-banner" class="alert alert-error hidden">
+        <div>
+          <strong id="system-error-title">تنبيه النظام</strong>
+          <div id="system-error-msg"></div>
+        </div>
+        <button class="btn btn-sm" id="btn-banner-log">فتح ملف السجل</button>
+      </div>
+
+      <!-- Live Automatic Run Banner (§10b) -->
+      <div id="live-banner" class="live-banner hidden">
+        <div class="live-banner-top">
+          <div>
+            <div id="live-status-text" class="live-status-text">جاري التشغيل التلقائي...</div>
+          </div>
+          <div class="live-metrics">
+            <span id="live-pct" class="tabular">0%</span>
+            <span id="live-elapsed" class="mono">00:00</span>
+            <span id="live-eta" class="mono">المتبقي: --:--</span>
+            <button class="btn btn-sm btn-danger" id="btn-cancel-job">إلغاء</button>
+          </div>
+        </div>
+        <div class="progress-track">
+          <div id="live-progress-fill" class="progress-fill" style="width: 0%"></div>
+        </div>
+        <div id="live-words-ticker" class="live-words-ticker hidden"></div>
+        <div id="live-timeline-strip" class="live-timeline-strip hidden"></div>
+      </div>
+
+      <!-- Dynamic Screen Outlet -->
+      <div id="screen-outlet"></div>
+    </main>
+  </div>
+
+  <!-- Modal Backdrop -->
+  <div id="modal-root" class="modal-backdrop hidden"></div>
+  <!-- Toast Container -->
+  <div id="toast-stack" class="toast-stack"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
