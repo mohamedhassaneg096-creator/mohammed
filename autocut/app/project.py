@@ -23,13 +23,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "width": 1920,
     "height": 1080,
     "fps": 30,
-    "whisper_model": "medium",
-    "language": "auto",
     "max_video_speed_change": 2.0,
     "default_motion_strength": 15,  # Section 5 specifies 15% default (5-40% range)
     "background_fill": "blurred",    # "blurred" | "black"
     "slowmo_smooth": "off",          # "off" | "blend" | "mci"
-    "theme": "dark",                 # "dark" | "light"
+    "theme": "blue_night",           # "blue_night" | "calm_forest" | "daylight"
     # Future-ready fields (Section 12)
     "aspect_preset": "16:9",
 }
@@ -129,6 +127,8 @@ def create_project(name: str, projects_root: Optional[Path] = None) -> Dict[str,
         "audio_filename": None,
         "audio_hash": None,
         "audio_duration": 0.0,
+        "transcript_filename": None,
+        "transcript_precision": None,
         "scenes_dir": "",
         "raw_text": "",
         "settings": dict(DEFAULT_SETTINGS),
@@ -208,6 +208,7 @@ def list_projects(projects_root: Optional[Path] = None) -> List[Dict[str, Any]]:
             "stage": meta.get("stage", "inputs"),
             "audio_filename": meta.get("audio_filename"),
             "audio_duration": meta.get("audio_duration", 0.0),
+            "transcript_filename": meta.get("transcript_filename"),
             "segment_count": len(cuts.get("segments", [])) if cuts else 0,
             "motion_count": len(motions.get("assignments", {})) if motions else 0,
             "has_output": out_video.exists(),

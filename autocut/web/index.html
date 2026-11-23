@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ar" dir="rtl">
+<html lang="ar" dir="rtl" data-theme="blue_night">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -19,7 +19,7 @@
           </svg>
         </span>
         <span class="brand-title">أوتوكَت · AutoCut</span>
-        <span id="app-version-tag" class="version-tag mono">v1.1.0</span>
+        <span id="app-version-tag" class="version-tag mono">v1.2.0</span>
       </div>
 
       <div class="topbar-center">
@@ -29,6 +29,11 @@
       </div>
 
       <div class="topbar-actions">
+        <div class="theme-switcher" id="theme-switcher" role="group" aria-label="المظهر">
+          <button class="theme-opt active" data-theme-pick="blue_night" title="ليل أزرق (الافتراضي)">ليل أزرق</button>
+          <button class="theme-opt" data-theme-pick="calm_forest" title="غابة هادية">غابة هادية</button>
+          <button class="theme-opt" data-theme-pick="daylight" title="نهار">نهار</button>
+        </div>
         <button class="btn btn-sm" id="btn-open-updates" title="فحص التحديثات وإعدادات المصدر">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           التحديثات
@@ -40,10 +45,6 @@
         <button class="btn btn-sm btn-ghost" id="btn-open-log" title="فتح ملف السجل">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
           السجل
-        </button>
-        <button class="btn btn-sm btn-ghost" id="btn-toggle-theme" title="تبديل المظهر">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
-          المظهر
         </button>
         <button class="btn btn-sm" id="btn-open-settings">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -57,7 +58,7 @@
       <div class="stepper-list">
         <button class="step-btn" data-stage="inputs"><span class="step-num tabular">1</span>المدخلات</button>
         <span class="step-arrow">←</span>
-        <button class="step-btn" data-stage="cuts"><span class="step-num tabular">2</span>التفريغ والقص</button>
+        <button class="step-btn" data-stage="cuts"><span class="step-num tabular">2</span>التفريغ (استيراد)</button>
         <span class="step-arrow">←</span>
         <button class="step-btn" data-stage="scenes"><span class="step-num tabular">3</span>المشاهد</button>
         <span class="step-arrow">←</span>
@@ -89,11 +90,11 @@
         <button class="btn btn-sm" id="btn-banner-log">فتح ملف السجل</button>
       </div>
 
-      <!-- Live Automatic Run Banner (§10b) -->
+      <!-- Live Pipeline Banner -->
       <div id="live-banner" class="live-banner hidden">
         <div class="live-banner-top">
           <div>
-            <div id="live-status-text" class="live-status-text">جاري التشغيل التلقائي...</div>
+            <div id="live-status-text" class="live-status-text">جاري التنفيذ...</div>
           </div>
           <div class="live-metrics">
             <span id="live-pct" class="tabular">0%</span>
@@ -105,7 +106,6 @@
         <div class="progress-track">
           <div id="live-progress-fill" class="progress-fill" style="width: 0%"></div>
         </div>
-        <div id="live-words-ticker" class="live-words-ticker hidden"></div>
         <div id="live-timeline-strip" class="live-timeline-strip hidden"></div>
       </div>
 

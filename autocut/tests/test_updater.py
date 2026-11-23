@@ -422,7 +422,8 @@ class UpdaterTests(unittest.TestCase):
         self.assertEqual(m1["upgraded_projects"], 1)
         pjson = json.loads((self.base_dir / "projects" / "p2" / "project.json").read_text(encoding="utf-8"))
         self.assertEqual(pjson["settings"]["fps"], 60)
-        self.assertIn("whisper_model", pjson["settings"])
+        self.assertIn("background_fill", pjson["settings"])
+        self.assertIn("theme", pjson["settings"])
         # Idempotent second run changes 0 projects
         m2 = run_all_migrations(base_dir=self.base_dir)
         self.assertEqual(m2["upgraded_projects"], 0)

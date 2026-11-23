@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -82,6 +83,8 @@ def default_self_test(base_dir: Path) -> Tuple[bool, str]:
             "app.motion",
             "app.render",
             "app.transcribe",
+            "app.transcript_import",
+            "app.workspace_helpers",
             "app.settings_store",
             "app.updater",
         ):
@@ -134,7 +137,7 @@ def _prune_old_backups(backups_dir: Path, keep: int = MAX_BACKUPS) -> None:
     if not backups_dir.exists():
         return
     dirs = [d for d in backups_dir.iterdir() if d.is_dir() and (d / "backup_meta.json").exists()]
-    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    dirs.sort(key=lambda d: ((_read_json(d / "backup_meta.json") or {}).get("created_at", ""), d.stat().st_mtime_ns), reverse=True)
     for old in dirs[keep:]:
         shutil.rmtree(old, ignore_errors=True)
 
@@ -146,7 +149,8 @@ def list_backups(base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
         return []
     items: List[Dict[str, Any]] = []
     for d in backups_dir.iterdir():
-        meta = _read_json(d / "backup_meta.json")
+        meta_path = d / "backup_meta.json"
+        meta = _read_json(meta_path)
         if d.is_dir() and isinstance(meta, dict):
             items.append({
                 "id": d.name,
@@ -154,8 +158,11 @@ def list_backups(base_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
                 "target_version": meta.get("target_version", ""),
                 "created_at": meta.get("created_at", ""),
                 "file_count": len(meta.get("backed_up_files") or []),
+                "_mtime_ns": meta_path.stat().st_mtime_ns if meta_path.exists() else 0,
             })
-    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    items.sort(key=lambda x: (x.get("created_at", ""), x.get("_mtime_ns", 0)), reverse=True)
+    for it in items:
+        it.pop("_mtime_ns", None)
     return items
 
 
@@ -216,7 +223,8 @@ def apply_staged_update(
     old_req_text = old_req_file.read_text(encoding="utf-8", errors="replace") if old_req_file.exists() else ""
 
     # 2. Backup all files to be replaced or deleted
-    ts = time.strftime("%Y%m%d_%H%M%S")
+    now_utc = datetime.now(timezone.utc)
+    ts = now_utc.strftime("%Y%m%d_%H%M%S_%f")
     backup_id = f"{old_ver}_{ts}"
     backup_dir = base_dir / "backups" / backup_id
     backup_files_dir = backup_dir / "files"
@@ -254,7 +262,7 @@ def apply_staged_update(
     _atomic_write_json(backup_dir / "backup_meta.json", {
         "old_version": old_ver,
         "target_version": new_ver,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "backed_up_files": backed_up_files,
         "added_files": added_files,
     })

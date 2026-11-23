@@ -1,4 +1,4 @@
-/* AutoCut Frontend Application (Arabic RTL, Offline, Zero External Dependencies) */
+/* AutoCut Frontend Application — v1.2.0 (Arabic RTL, Offline, External Transcript Import) */
 
 (() => {
   "use strict";
@@ -10,25 +10,40 @@
     { id: "right", label: "Right", ar: "تحريك لليمين", icon: "⇢" },
   ];
 
+  const THEMES = {
+    blue_night: "ليل أزرق",
+    calm_forest: "غابة هادية",
+    daylight: "نهار",
+  };
+
   const state = {
     view: "home", // home | inputs | cuts | scenes | motion | export | review
+    theme: "blue_night",
     health: null,
     projects: [],
     project: null,
+    transcript: null,
     cuts: null,
     timeline: null,
     motions: { global_strength: 15, assignments: {} },
     parsedPreview: { segments: [], warnings: [] },
+    companions: null,
+    transcriptImportError: null,
+    cutsSubTab: "preview", // preview | cuts
+    transcriptFilter: "all", // all | suspicious
+    showPasteBox: false,
+    inputsMissingList: null,
+    showQuickPathBox: false,
+    waveformCache: {}, // url -> number[] peaks
     activeJob: null,
     pollTimer: null,
-    autoPendingExport: false,
     motionTab: "zoom_in",
     motionCurrentSegId: null,
-    motionHistory: [], // undo stack for Z shortcut
+    motionHistory: [],
     previewVideoUrl: null,
     reviewSelectedSegId: null,
     globalSettings: null,
-    updateModalTab: "updates", // updates | source | local
+    updateModalTab: "updates",
     updatePlan: null,
     updatePlanError: null,
     updateJob: null,
@@ -105,6 +120,8 @@
       const msg = data.error || data.detail || "حدث خطأ غير متوقع في الخادم.";
       const err = new Error(msg);
       err.hint = data.hint || "";
+      err.code = data.code || "";
+      err.preview_lines = data.preview_lines || [];
       throw err;
     }
     return data;
@@ -139,7 +156,7 @@
         <h3 style="margin:0;font-size:18px">${esc(title)}</h3>
         <button class="btn btn-sm btn-ghost" id="m-close">✕</button>
       </div>
-      <p style="color:var(--text-muted);margin:0 0 20px">${esc(message)}</p>
+      <p style="color:var(--text-2);margin:0 0 20px">${esc(message)}</p>
       <div style="display:flex;justify-content:flex-end;gap:10px">
         <button class="btn" id="m-cancel">إلغاء</button>
         <button class="btn btn-danger" id="m-ok">تأكيد</button>
@@ -153,12 +170,139 @@
     };
   }
 
-  // ---------- Theme & Health ----------
-  function applyTheme(theme) {
-    document.documentElement.setAttribute("data-theme", theme === "light" ? "light" : "dark");
-    localStorage.setItem("autocut_theme", theme === "light" ? "light" : "dark");
+  // ---------- 3-Theme Engine ----------
+  function normalizeTheme(raw) {
+    if (raw === "dark") return "blue_night";
+    if (raw === "light") return "daylight";
+    if (THEMES[raw]) return raw;
+    return "blue_night";
   }
 
+  async function applyTheme(rawTheme, persist = false) {
+    const theme = normalizeTheme(rawTheme);
+    state.theme = theme;
+    document.documentElement.setAttribute("data-theme", theme);
+    localStorage.setItem("autocut_theme", theme);
+
+    document.querySelectorAll("[data-theme-pick]").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.themePick === theme);
+    });
+
+    if (persist) {
+      try {
+        const res = await apiJson("/api/settings/global", "PUT", { defaults: { theme } });
+        state.globalSettings = res;
+        if (state.project) {
+          const pRes = await apiJson(`/api/projects/${state.project.id}`, "PATCH", { settings: { theme } });
+          state.project = pRes.project;
+        }
+      } catch {
+        // non-blocking theme save
+      }
+    }
+  }
+
+  // ---------- Lightweight Web Audio Waveform Renderer ----------
+  function fallbackPeaks(count = 72) {
+    const arr = [];
+    for (let i = 0; i < count; i++) {
+      arr.push(0.22 + 0.62 * Math.abs(Math.sin(i * 0.45) * Math.cos(i * 0.17)));
+    }
+    return arr;
+  }
+
+  async function loadPeaksForUrl(audioUrl) {
+    if (state.waveformCache[audioUrl]) return state.waveformCache[audioUrl];
+    try {
+      const resp = await fetch(audioUrl);
+      const buf = await resp.arrayBuffer();
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) throw new Error("No AudioContext");
+      const ctx = new Ctx();
+      const decoded = await ctx.decodeAudioData(buf);
+      const ch = decoded.getChannelData(0);
+      const bars = 80;
+      const step = Math.max(1, Math.floor(ch.length / bars));
+      const peaks = [];
+      let maxAmp = 0.01;
+      for (let b = 0; b < bars; b++) {
+        let sum = 0;
+        const start = b * step;
+        const end = Math.min(ch.length, start + step);
+        for (let j = start; j < end; j += 8) {
+          const v = Math.abs(ch[j]);
+          if (v > sum) sum = v;
+        }
+        if (sum > maxAmp) maxAmp = sum;
+        peaks.push(sum);
+      }
+      const norm = peaks.map((p) => Math.max(0.1, p / maxAmp));
+      state.waveformCache[audioUrl] = norm;
+      ctx.close().catch(() => {});
+      return norm;
+    } catch {
+      const fb = fallbackPeaks(80);
+      state.waveformCache[audioUrl] = fb;
+      return fb;
+    }
+  }
+
+  function paintWaveformCanvas(canvas, peaks, ratio = 0) {
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    const w = Math.max(180, Math.floor(rect.width || 300));
+    const h = Math.max(36, Math.floor(rect.height || 44));
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+
+    const cs = getComputedStyle(document.documentElement);
+    const accent = cs.getPropertyValue("--accent").trim() || "#6C9BFF";
+    const muted = cs.getPropertyValue("--border-strong").trim() || "#374354";
+
+    const n = peaks.length;
+    const barW = Math.max(2, (w - (n - 1) * 2) / n);
+    const stepX = w / n;
+    const playIdx = Math.floor(Math.max(0, Math.min(1, ratio)) * n);
+
+    for (let i = 0; i < n; i++) {
+      const amp = Math.max(0.12, Math.min(1, peaks[i]));
+      const bh = Math.max(4, amp * (h - 8));
+      const x = i * stepX;
+      const y = (h - bh) / 2;
+      ctx.fillStyle = i <= playIdx && ratio > 0 ? accent : muted;
+      ctx.fillRect(x, y, Math.max(1.5, barW), bh);
+    }
+  }
+
+  async function bindWaveform(canvasId, audioEl, audioUrl) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas || !audioUrl) return;
+    const peaks = await loadPeaksForUrl(audioUrl);
+    const redraw = () => {
+      const dur = (audioEl && audioEl.duration) || state.project?.audio_duration || 1;
+      const cur = audioEl ? audioEl.currentTime : 0;
+      paintWaveformCanvas(canvas, peaks, dur > 0 ? cur / dur : 0);
+    };
+    redraw();
+    if (audioEl) {
+      audioEl.addEventListener("timeupdate", redraw);
+      canvas.onclick = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        const dur = audioEl.duration || state.project?.audio_duration || 0;
+        if (dur > 0) {
+          audioEl.currentTime = ratio * dur;
+          audioEl.play().catch(() => {});
+        }
+      };
+    }
+  }
+
+  // ---------- Health & Startup ----------
   async function loadHealth() {
     try {
       const h = await fetch("/api/health").then((r) => r.json());
@@ -201,7 +345,7 @@
         fetch("/api/updates/ack-result", { method: "POST" }).catch(() => {});
       }
     } catch {
-      // ignore if offline during startup
+      // offline/startup ignore
     }
   }
 
@@ -253,7 +397,7 @@
     }
   }
 
-  // ---------- Project Loading & Parsing ----------
+  // ---------- Project Loading ----------
   async function loadProjects() {
     const data = await api("/api/projects");
     state.projects = data.projects || [];
@@ -263,11 +407,18 @@
   async function openProject(pid) {
     const data = await api(`/api/projects/${pid}`);
     state.project = data.project;
+    state.transcript = data.transcript || null;
     state.cuts = data.cuts;
     state.timeline = data.timeline;
     state.motions = data.motions || { global_strength: 15, assignments: {} };
     state.hasOutput = Boolean(data.has_output);
-    applyTheme(state.project.settings?.theme || localStorage.getItem("autocut_theme") || "dark");
+    state.transcriptImportError = null;
+    state.inputsMissingList = null;
+    state.companions = null;
+
+    if (state.project.settings?.theme) {
+      applyTheme(state.project.settings.theme, false);
+    }
 
     if (state.project.raw_text) {
       try {
@@ -286,7 +437,7 @@
     await navigate(stage === "home" ? "inputs" : stage);
   }
 
-  // ---------- Live Job Polling (§10b) ----------
+  // ---------- Live Job Polling (Export) ----------
   function renderLiveBanner() {
     const banner = document.getElementById("live-banner");
     const job = state.activeJob;
@@ -303,16 +454,8 @@
       job.eta != null ? `المتبقي: ${fmtTime(job.eta)}` : "المتبقي: --:--";
     document.getElementById("live-progress-fill").style.width = `${Math.min(100, job.progress || 0)}%`;
 
-    const ticker = document.getElementById("live-words-ticker");
-    if (job.words_preview) {
-      ticker.textContent = `الكلمات الملتقطة: ${job.words_preview}`;
-      ticker.classList.remove("hidden");
-    } else {
-      ticker.classList.add("hidden");
-    }
-
     const strip = document.getElementById("live-timeline-strip");
-    const items = (job.timeline?.items) || (state.timeline?.items) || (job.cuts?.segments) || [];
+    const items = (job.timeline?.items) || (state.timeline?.items) || [];
     if (items.length > 0) {
       strip.classList.remove("hidden");
       strip.innerHTML = items.slice(0, 60).map((it) => {
@@ -362,6 +505,100 @@
     }, 600);
   }
 
+  // ---------- Transcript Import Shared Handlers ----------
+  function renderImportErrorHtml(errObj) {
+    if (!errObj) return "";
+    const previewHtml = errObj.preview_lines?.length
+      ? `
+        <div style="margin-top:10px">
+          <div class="field-label" style="margin-bottom:6px">أول 30 سطراً من الملف:</div>
+          <div class="unknown-preview-box">${esc(errObj.preview_lines.slice(0, 30).join("\n"))}</div>
+          <div style="margin-top:10px;display:flex;justify-content:flex-end">
+            <button class="btn btn-sm" id="btn-unknown-copy-report">نسخ تقرير المشكلة</button>
+          </div>
+        </div>
+      `
+      : "";
+    return `
+      <div class="alert alert-error" style="display:block;margin-top:10px">
+        <div><strong>${esc(errObj.message)}</strong></div>
+        ${errObj.hint ? `<div class="field-hint" style="color:var(--text);margin-top:4px">${esc(errObj.hint)}</div>` : ""}
+        ${previewHtml}
+      </div>
+    `;
+  }
+
+  async function performTranscriptUpload({ file, text, filename, localPath }) {
+    if (!state.project) return;
+    state.transcriptImportError = null;
+    try {
+      let res;
+      if (file) {
+        const fd = new FormData();
+        fd.append("file", file);
+        res = await api(`/api/projects/${state.project.id}/import-transcript`, { method: "POST", body: fd });
+      } else {
+        res = await apiJson(`/api/projects/${state.project.id}/import-transcript`, "POST", {
+          text,
+          filename: filename || "pasted_transcript.txt",
+          local_path: localPath || "",
+        });
+      }
+      state.transcript = res.transcript;
+      if (res.project) state.project = res.project;
+      state.inputsMissingList = null;
+      markSaved();
+      toast(`تم استيراد التفريغ (${res.transcript.format_label}).`, "success");
+      render();
+    } catch (err) {
+      state.transcriptImportError = {
+        message: err.message,
+        hint: err.hint || "",
+        code: err.code || "",
+        preview_lines: err.preview_lines || [],
+      };
+      toast(err.message, "error");
+      render();
+    }
+  }
+
+  // Recursive file extraction from folder drag-and-drop
+  async function extractFilesFromDataTransfer(dt) {
+    const out = [];
+    const items = Array.from(dt.items || []);
+    const readEntry = (entry, prefix = "") => new Promise((resolve) => {
+      if (!entry) return resolve();
+      if (entry.isFile) {
+        entry.file((file) => {
+          out.push({ file, relpath: prefix + file.name });
+          resolve();
+        }, () => resolve());
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const readBatch = () => {
+          reader.readEntries(async (entries) => {
+            if (!entries.length) return resolve();
+            await Promise.all(entries.map((en) => readEntry(en, `${prefix}${entry.name}/`)));
+            readBatch();
+          }, () => resolve());
+        };
+        readBatch();
+      } else {
+        resolve();
+      }
+    });
+
+    const entries = items.map((it) => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean);
+    if (entries.length) {
+      await Promise.all(entries.map((en) => readEntry(en, "")));
+      return out;
+    }
+    return Array.from(dt.files || []).map((file) => ({
+      file,
+      relpath: file.webkitRelativePath || file.name,
+    }));
+  }
+
   // ---------- Screen 0: Home ----------
   function renderHome(outlet) {
     const cardsHtml = state.projects.length
@@ -371,8 +608,8 @@
               ? `<img src="${esc(p.thumbnail_url)}" alt="${esc(p.name)}" />`
               : `<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="4" width="20" height="16" rx="2"/><polygon points="10 9 15 12 10 15 10 9"/></svg>`;
             const stageNames = {
-              inputs: "المدخلات",
-              cuts: "التفريغ والقص",
+              inputs: "مشروع جديد / المدخلات",
+              cuts: "التفريغ (استيراد)",
               scenes: "المشاهد",
               motion: "الحركات",
               export: "مكتمل للتصدير",
@@ -391,7 +628,7 @@
                 </div>
                 <div class="meta-line">
                   <span>آخر تحديث: ${esc(fmtDate(p.updated_at))}</span>
-                  ${p.has_output ? `<span>·</span><span style="color:var(--success)">فيديو جاهز ✓</span>` : ""}
+                  ${p.has_output ? `<span>·</span><span style="color:var(--success-text)">فيديو جاهز ✓</span>` : ""}
                 </div>
                 <div class="project-actions">
                   <button class="btn btn-primary btn-sm" data-open-proj="${esc(p.id)}">فتح المشروع</button>
@@ -406,20 +643,37 @@
             <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>
           </div>
           <h3 style="margin:0 0 8px">لا توجد مشاريع بعد</h3>
-          <p style="margin:0 0 20px;color:var(--text-muted)">أنشئ مشروعك الأول ثم أضف ملف الصوت والنص المرقم ومجلد المشاهد.</p>
-          <button class="btn btn-primary btn-lg" id="btn-empty-new">مشروع جديد</button>
+          <p style="margin:0 0 20px;color:var(--text-2)">ابدأ بمشروع جديد وأضف ملفاتك، أو افتح مشروعاً تجريبياً جاهزاً للتجربة الفورية.</p>
+          <div style="display:flex;justify-content:center;gap:10px;flex-wrap:wrap">
+            <button class="btn btn-primary btn-lg" id="btn-empty-new">+ مشروع جديد</button>
+            <button class="btn btn-lg" id="btn-empty-demo">مشروع تجريبي</button>
+          </div>
         </div>`;
 
     outlet.innerHTML = `
       <div class="section-header">
         <div>
           <h1 class="section-title">مشاريع أوتوكَت</h1>
-          <p class="section-subtitle">أداة تجميع الفيديو التلقائية محلياً بالكامل — يتم حفظ حالة كل مشروع تلقائياً.</p>
+          <p class="section-subtitle">استورد ملف التفريغ (JSON / SRT / VTT من Vibe أو Whisper) واجمع الفيديو محلياً بالكامل.</p>
         </div>
-        <button class="btn btn-primary btn-lg" id="btn-new-project">+ مشروع جديد</button>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn btn-lg" id="btn-demo-project">مشروع تجريبي</button>
+          <button class="btn btn-primary btn-lg" id="btn-new-project">+ مشروع جديد</button>
+        </div>
       </div>
       ${cardsHtml}
     `;
+
+    const createDemo = async () => {
+      try {
+        toast("جاري إنشاء المشروع التجريبي...", "info");
+        const res = await apiJson("/api/projects/demo", "POST", {});
+        await openProject(res.project.id);
+        toast("تم إنشاء المشروع التجريبي جاهزاً للتجربة!", "success");
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
 
     const openNewModal = () => {
       openModal(`
@@ -433,7 +687,7 @@
         </div>
         <div style="display:flex;justify-content:flex-end;gap:10px">
           <button class="btn" id="np-cancel">إلغاء</button>
-          <button class="btn btn-primary" id="np-create">إنشاء وبدء العمل</button>
+          <button class="btn btn-primary" id="np-create">إنشاء وفتح شاشة المواد</button>
         </div>
       `);
       document.getElementById("np-close").onclick = closeModal;
@@ -451,8 +705,11 @@
     };
 
     document.getElementById("btn-new-project").onclick = openNewModal;
+    document.getElementById("btn-demo-project").onclick = createDemo;
     const emptyBtn = document.getElementById("btn-empty-new");
     if (emptyBtn) emptyBtn.onclick = openNewModal;
+    const emptyDemo = document.getElementById("btn-empty-demo");
+    if (emptyDemo) emptyDemo.onclick = createDemo;
 
     outlet.querySelectorAll("[data-open-proj]").forEach((btn) => {
       btn.onclick = () => openProject(btn.dataset.openProj);
@@ -472,124 +729,384 @@
     });
   }
 
-  // ---------- Screen 1: Inputs ----------
+  // ---------- Screen 1: "مشروع جديد" (2x2 Materials Grid + Quick Folder + Waveform) ----------
   function renderInputs(outlet) {
     const p = state.project;
+    const tr = state.transcript;
     const scan = p.scenes_scan;
     const parsed = state.parsedPreview || { segments: [], warnings: [] };
     const segCount = parsed.segments?.length || 0;
 
-    let scanHtml = "";
-    if (scan) {
-      if (!scan.ok && scan.error) {
-        scanHtml = `<div class="alert alert-error" style="margin-top:12px"><div><strong>تعارض أو خطأ في مجلد المشاهد:</strong><div>${esc(scan.error)}</div></div></div>`;
-      } else {
-        const count = Object.keys(scan.scenes || {}).length;
-        const missing = scan.missing_numbers || [];
-        const extra = scan.extra_numbers || [];
-        scanHtml = `
-          <div class="alert alert-success" style="margin-top:12px">
-            <div>تم العثور على <strong class="tabular">${count}</strong> مشهد صالح للتركيب.</div>
+    // Card 1: Audio status
+    const hasAudio = Boolean(p.audio_path && p.audio_filename);
+    const audioStatus = hasAudio ? `<span class="status-pill ready">جاهز ✓</span>` : `<span class="status-pill required">مطلوب</span>`;
+
+    // Card 2: Transcript status
+    const suspCount = tr?.stats?.suspicious_count || 0;
+    const hasTr = Boolean(tr && tr.segments?.length);
+    const trStatus = !hasTr
+      ? `<span class="status-pill required">مطلوب</span>`
+      : tr.precision === "sentence" || suspCount > 0
+        ? `<span class="status-pill warn">تحذير</span>`
+        : `<span class="status-pill ready">جاهز ✓</span>`;
+
+    // Card 3: Numbered Script status
+    const hasScript = segCount > 0;
+    const scriptStatus = !hasScript
+      ? `<span class="status-pill required">مطلوب</span>`
+      : parsed.warnings?.length
+        ? `<span class="status-pill warn">تحذير</span>`
+        : `<span class="status-pill ready">جاهز ✓</span>`;
+
+    // Card 4: Scenes status
+    const sceneEntries = scan?.scenes ? Object.values(scan.scenes) : [];
+    const sceneCount = sceneEntries.length;
+    const imgCount = sceneEntries.filter((x) => x.type === "image").length;
+    const vidCount = sceneEntries.filter((x) => x.type === "video").length;
+    const hasSceneWarn = Boolean(
+      scan && ((scan.ok === false && scan.error) || (scan.missing_numbers?.length) || (scan.extra_numbers?.length))
+    );
+    const scenesStatus = !scan || sceneCount === 0
+      ? `<span class="status-pill required">مطلوب</span>`
+      : hasSceneWarn
+        ? `<span class="status-pill warn">تحذير</span>`
+        : `<span class="status-pill ready">جاهز ✓</span>`;
+
+    const companion = state.companions;
+    const companionHtml = companion && (companion.transcript_name || companion.script_name)
+      ? `<div class="alert alert-success" style="margin-top:8px;margin-bottom:0">
+          <div>
+            <strong>تم العثور على ملفات مجاورة:</strong>
+            <div class="meta-line" style="color:inherit">
+              ${companion.transcript_name ? `<span>تفريغ: <span class="ltr-name mono">${esc(companion.transcript_name)}</span></span>` : ""}
+              ${companion.script_name ? `<span>نص: <span class="ltr-name mono">${esc(companion.script_name)}</span></span>` : ""}
+            </div>
           </div>
-          ${missing.length ? `<div class="alert alert-warning"><div><strong>أرقام مفقودة في المجلد:</strong> <span class="tabular">${esc(missing.join("، "))}</span></div></div>` : ""}
-          ${extra.length ? `<div class="alert alert-warning"><div><strong>مشاهد إضافية بدون نص:</strong> <span class="tabular">${esc(extra.join("، "))}</span></div></div>` : ""}
-        `;
-      }
-    }
+          <button class="btn btn-sm btn-primary" id="btn-apply-companions">استيرادها الآن</button>
+        </div>`
+      : "";
+
+    const scenesThumbsHtml = sceneEntries.length
+      ? `<div class="scene-thumb-strip-mini">
+          ${sceneEntries.slice(0, 12).map((sc) => `
+            <div class="scene-mini-chip" title="${esc(sc.filename)}">
+              ${sc.thumbnail_url ? `<img src="${esc(sc.thumbnail_url)}" alt="#${sc.number}" />` : `<div style="height:42px;display:flex;align-items:center;justify-content:center;font-size:11px">#${sc.number}</div>`}
+              <span class="tabular">#${sc.number}</span>
+            </div>
+          `).join("")}
+        </div>`
+      : "";
+
+    const bgLabel = p.settings.background_fill === "black" ? "خلفية سوداء" : "تمويه الخلفية";
 
     outlet.innerHTML = `
-      <div class="section-header">
+      <div class="section-header" style="margin-bottom:12px">
         <div>
-          <h1 class="section-title">1. المدخلات الأساسية</h1>
-          <p class="section-subtitle">أضف ملف الصوت الكامل، والصق النص المرقم، وحدد مجلد المشاهد ثم اضغط التشغيل التلقائي.</p>
+          <h1 class="section-title">مشروع جديد</h1>
+          <p class="section-subtitle">رتّب المواد الأربع هنا، أو أسقط مجلد المشروع دفعة واحدة ثم اضغط التشغيل.</p>
         </div>
-        <button class="btn" id="btn-inputs-settings">إعدادات المشروع</button>
+        <button class="btn" id="btn-inputs-cuts-screen">فتح شاشة التفريغ (استيراد)</button>
       </div>
 
-      <div class="inputs-grid">
-        <div style="display:flex;flex-direction:column;gap:20px">
-          <!-- Audio Upload Card -->
-          <section class="card">
-            <h2 class="card-title">1) ملف التعليق الصوتي</h2>
-            <div class="dropzone" id="audio-dropzone">
-              <input type="file" id="audio-file-input" accept=".mp3,.wav,.m4a,.ogg,.mp4,audio/*" />
-              <div style="font-weight:600;margin-bottom:4px">اسحب ملف الصوت وأفلته هنا، أو انقر للاختيار</div>
-              <div class="field-hint">الصيغ المدعومة: MP3 · WAV · M4A · OGG · MP4 (يبقى الصوت كما هو دون قص)</div>
-            </div>
-            ${p.audio_filename ? `
-              <div class="alert alert-success" style="margin-top:12px;margin-bottom:0">
-                <div>
-                  <strong>${esc(p.audio_filename)}</strong>
-                  <div class="meta-line"><span>المدة: <span class="mono">${fmtDur(p.audio_duration)}</span></span></div>
-                </div>
-                <audio controls src="/api/projects/${esc(p.id)}/audio" style="height:32px;max-width:220px"></audio>
-              </div>
-            ` : `<div class="field-hint">لم يتم اختيار ملف صوت بعد.</div>`}
-          </section>
-
-          <!-- Scenes Folder Card -->
-          <section class="card">
-            <h2 class="card-title">2) مجلد المشاهد المرقمة</h2>
-            <div class="field">
-              <label class="field-label" for="scenes-dir-input">مسار المجلد المحلي</label>
-              <div style="display:flex;gap:8px">
-                <input class="input mono" style="direction:ltr;text-align:left" id="scenes-dir-input" value="${esc(p.scenes_dir || "")}" placeholder="C:\\Videos\\MyScenes" />
-                <button class="btn" id="btn-pick-folder">استعراض</button>
-                <button class="btn btn-primary" id="btn-scan-scenes">فحص</button>
-              </div>
-              <div class="field-hint">يتم التعرف على رقم المشهد من أول رقم في اسم الملف (مثل <span class="mono">7.png</span> أو <span class="mono">scene_07.mp4</span>).</div>
-            </div>
-
-            <div class="dropzone" id="scenes-dropzone">
-              <input type="file" id="scenes-files-input" multiple accept=".png,.jpg,.jpeg,.webp,.mp4,.mov,.mkv,.webm" />
-              <div style="font-size:13px;font-weight:600">أو اسحب وأفلت صور ومقاطع المشاهد هنا مباشرة</div>
-            </div>
-
-            ${scanHtml}
-          </section>
-
-          <!-- Quick Settings Summary -->
-          <section class="card">
-            <h2 class="card-title">ملخص الإعدادات الحالية</h2>
-            <div class="meta-line" style="font-size:13px;gap:12px">
-              <span>الدقة: <strong class="mono">${esc(p.settings.resolution)}</strong></span>
-              <span>·</span>
-              <span>الإطارات: <strong class="tabular">${p.settings.fps} fps</strong></span>
-              <span>·</span>
-              <span>Whisper: <strong class="mono">${esc(p.settings.whisper_model)}</strong></span>
-              <span>·</span>
-              <span>اللغة: <strong>${esc(p.settings.language)}</strong></span>
-              <span>·</span>
-              <span>قوة الحركة: <strong class="tabular">${p.settings.default_motion_strength}%</strong></span>
-            </div>
-          </section>
+      <!-- Top Row: Project Name + Quick Folder Dropzone -->
+      <div class="new-proj-top-row">
+        <div class="card" style="padding:14px 16px;display:flex;flex-direction:column;justify-content:center">
+          <label class="field-label" for="proj-name-input" style="margin-bottom:6px">اسم المشروع</label>
+          <input class="input" id="proj-name-input" value="${esc(p.name || "")}" placeholder="مثال: وثائقي الحضارة الأندلسية" />
         </div>
 
-        <!-- Numbered Script Textarea -->
-        <section class="card">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-            <h2 class="card-title" style="margin:0">3) النص المرقم (1..N)</h2>
-            <span class="tabular" id="parsed-seg-count" style="font-size:13px;color:var(--accent);font-weight:600">
-              ${segCount} مقطع مكتشف
-            </span>
+        <div class="quick-folder-zone" id="quick-folder-dz">
+          <div style="min-width:0">
+            <div style="font-weight:700;font-size:14px">مشروع سريع من فولدر</div>
+            <div class="field-hint" style="margin-top:2px">أسقط مجلد المشروع هنا لتعبئة الصوت والتفريغ و<span class="mono">script.txt</span> و<span class="mono">scenes/</span> تلقائياً</div>
           </div>
-          <textarea class="textarea" id="raw-text-input" placeholder="1 أول بضع كلمات من المقطع الأول&#10;2 أول بضع كلمات من المقطع الثاني&#10;٣ يمكن استخدام الأرقام العربية أو الفواصل المختلفة...">${esc(p.raw_text || "")}</textarea>
-          <div class="field-hint">يقبل الصيغ: <span class="mono">1 نص</span> · <span class="mono">1. نص</span> · <span class="mono">1- نص</span> · <span class="mono">[1] نص</span> · <span class="mono">١: نص</span>. الأسطر بدون رقم تكمل المقطع السابق.</div>
-          <div id="text-warnings-box" style="margin-top:10px">
-            ${(parsed.warnings || []).map((w) => `<div class="alert alert-warning" style="margin-bottom:8px">${esc(w)}</div>`).join("")}
+          <div style="display:flex;gap:8px;flex-shrink:0" onclick="event.stopPropagation()">
+            <label class="btn btn-sm" style="cursor:pointer">
+              اختر مجلد
+              <input type="file" id="quick-folder-input" webkitdirectory directory multiple style="display:none" />
+            </label>
+            <button class="btn btn-sm btn-ghost" id="btn-toggle-quick-path">مسار محلي</button>
           </div>
+        </div>
+      </div>
+
+      ${state.showQuickPathBox ? `
+        <div class="card" style="padding:12px 16px;margin-bottom:16px">
+          <div style="display:flex;gap:8px;align-items:center">
+            <input class="input mono" style="direction:ltr;text-align:left" id="quick-folder-path-input" placeholder="C:\\Projects\\MyEpisode" />
+            <button class="btn btn-primary btn-sm" id="btn-apply-quick-path">فحص وتعبئة</button>
+          </div>
+        </div>
+      ` : ""}
+
+      <!-- 2x2 Grid of 4 Numbered Material Cards -->
+      <div class="materials-grid">
+        <!-- Card 1: Audio -->
+        <section class="material-card">
+          <div class="material-card-head">
+            <div class="material-card-title">
+              <span class="card-step-num tabular">1</span>
+              <span>الصوت</span>
+            </div>
+            ${audioStatus}
+          </div>
+
+          <div class="dropzone" id="audio-dropzone">
+            <input type="file" id="audio-file-input" accept=".mp3,.wav,.m4a,.ogg,.aac,.flac,.mp4,audio/*" />
+            <div style="font-weight:600;font-size:13.5px">اسحب ملف الصوت هنا أو انقر للاختيار</div>
+            <div class="field-hint">MP3 · WAV · M4A · OGG — يبقى الصوت أصلياً دون قص</div>
+          </div>
+
+          ${hasAudio ? `
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:13px">
+              <strong class="ltr-name mono">${esc(p.audio_filename)}</strong>
+              <span class="mono" style="color:var(--text-2)">${fmtDur(p.audio_duration)}</span>
+            </div>
+            <div class="waveform-box">
+              <canvas class="waveform-canvas" id="inputs-waveform-canvas"></canvas>
+            </div>
+            <audio id="inputs-audio-player" controls src="/api/projects/${esc(p.id)}/audio" style="width:100%;height:34px"></audio>
+          ` : `<div class="field-hint" style="margin-top:0">لم يتم اختيار ملف صوت بعد.</div>`}
+
+          ${companionHtml}
+        </section>
+
+        <!-- Card 2: Transcript -->
+        <section class="material-card">
+          <div class="material-card-head">
+            <div class="material-card-title">
+              <span class="card-step-num tabular">2</span>
+              <span>التفريغ</span>
+            </div>
+            ${trStatus}
+          </div>
+
+          <div class="vibe-guide-box">
+            <strong>استيراد من Vibe أو Whisper:</strong>
+            في برنامج <span class="mono">Vibe</span> افتح <strong>More Options</strong> ← فعّل <strong>Word timestamps</strong> ← صدّر بصيغة <strong>JSON</strong>.
+            (يقبل أيضاً <span class="mono">SRT</span> و <span class="mono">VTT</span>).
+          </div>
+
+          <div class="dropzone" id="tr-card-dropzone">
+            <input type="file" id="tr-card-file-input" accept=".json,.srt,.vtt,text/plain" />
+            <div style="font-weight:600;font-size:13.5px">اسحب ملف التفريغ (<span class="mono">JSON / SRT / VTT</span>) أو انقر للاختيار</div>
+          </div>
+
+          ${hasTr ? `
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+              <span class="ltr-name mono" style="font-size:13px;font-weight:600">${esc(tr.filename)}</span>
+              <span class="precision-badge ${tr.precision === "word" ? "precision-word" : "precision-sentence"}">${esc(tr.format_label)}</span>
+            </div>
+            <div class="meta-line">
+              <span class="tabular">${tr.stats?.word_count || 0} كلمة</span>
+              <span>·</span>
+              <span>آخر توقيت: <span class="mono">${fmtTime(tr.last_timestamp)}</span></span>
+              <span>·</span>
+              <span>التغطية: <span class="tabular">${tr.coverage_pct}%</span></span>
+              ${suspCount ? `<span>·</span><span style="color:var(--warning-text)">${suspCount === 1 ? "سطر مشبوه واحد" : suspCount === 2 ? "سطران مشبوهان" : `${suspCount} سطور مشبوهة`}</span>` : ""}
+            </div>
+            ${tr.precision_hint ? `<div class="alert alert-warning" style="margin-bottom:0">${esc(tr.precision_hint)}</div>` : ""}
+          ` : `<div class="field-hint" style="margin-top:0">لم يتم استيراد ملف تفريغ بعد.</div>`}
+
+          ${renderImportErrorHtml(state.transcriptImportError)}
+        </section>
+
+        <!-- Card 3: Numbered Script -->
+        <section class="material-card">
+          <div class="material-card-head">
+            <div class="material-card-title">
+              <span class="card-step-num tabular">3</span>
+              <span>النص المرقّم</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span class="tabular" id="parsed-seg-count" style="font-size:12px;color:var(--accent);font-weight:700">${segCount} مقطع</span>
+              ${scriptStatus}
+            </div>
+          </div>
+
+          <textarea class="textarea" id="raw-text-input" style="min-height:175px" placeholder="1. الجملة الأولى للمشهد الأول&#10;2. الجملة الثانية للمشهد الثاني&#10;3. ...">${esc(p.raw_text || "")}</textarea>
+
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+            <label class="btn btn-sm" style="cursor:pointer">
+              استيراد ملف .txt
+              <input type="file" id="script-txt-input" accept=".txt,text/plain" style="display:none" />
+            </label>
+            <span class="field-hint" style="margin-top:0">يقبل <span class="mono">1 نص</span> · <span class="mono">1.</span> · <span class="mono">[1]</span> · <span class="mono">١:</span></span>
+          </div>
+
+          <div id="text-warnings-box">
+            ${(parsed.warnings || []).map((w) => `<div class="alert alert-warning" style="margin-bottom:6px">${esc(w)}</div>`).join("")}
+          </div>
+        </section>
+
+        <!-- Card 4: Scenes -->
+        <section class="material-card">
+          <div class="material-card-head">
+            <div class="material-card-title">
+              <span class="card-step-num tabular">4</span>
+              <span>المشاهد</span>
+            </div>
+            ${scenesStatus}
+          </div>
+
+          <div style="display:flex;gap:8px">
+            <input class="input mono" style="direction:ltr;text-align:left" id="scenes-dir-input" value="${esc(p.scenes_dir || "")}" placeholder="C:\\Videos\\MyScenes" />
+            <button class="btn btn-sm" id="btn-pick-folder">استعراض</button>
+            <button class="btn btn-sm btn-primary" id="btn-scan-scenes">فحص</button>
+          </div>
+
+          <div class="dropzone" id="scenes-dropzone" style="padding:12px">
+            <input type="file" id="scenes-files-input" multiple accept=".png,.jpg,.jpeg,.webp,.mp4,.mov,.mkv,.webm" />
+            <div style="font-size:13px;font-weight:600">أو اسحب صور ومقاطع المشاهد هنا (1.png، scene_2.mp4...)</div>
+          </div>
+
+          ${scan ? (
+            !scan.ok && scan.error
+              ? `<div class="alert alert-error" style="margin-bottom:0">${esc(scan.error)}</div>`
+              : `<div class="meta-line">
+                  <strong class="tabular">${sceneCount} مشهد</strong>
+                  <span>(<span class="tabular">${imgCount}</span> صورة · <span class="tabular">${vidCount}</span> فيديو)</span>
+                </div>
+                ${scenesThumbsHtml}
+                ${scan.missing_numbers?.length ? `<div class="alert alert-warning" style="margin-bottom:0"><strong>أرقام مفقودة:</strong> <span class="tabular">${esc(scan.missing_numbers.join("، "))}</span></div>` : ""}
+                ${scan.extra_numbers?.length ? `<div class="alert alert-warning" style="margin-bottom:0"><strong>مشاهد بدون نص:</strong> <span class="tabular">${esc(scan.extra_numbers.join("، "))}</span></div>` : ""}`
+          ) : `<div class="field-hint" style="margin-top:0">لم يتم فحص مجلد المشاهد بعد.</div>`}
         </section>
       </div>
 
+      <!-- Compact Settings Summary Line -->
+      <div class="settings-summary-strip">
+        <div class="meta-line" style="font-size:13px;gap:12px">
+          <span>الإعدادات:</span>
+          <span>الدقة <strong class="mono">${esc(p.settings.resolution)}</strong></span>
+          <span>·</span>
+          <span><strong class="tabular">${p.settings.fps} fps</strong></span>
+          <span>·</span>
+          <span>قوة الحركة <strong class="tabular">${p.settings.default_motion_strength}%</strong></span>
+          <span>·</span>
+          <span><strong>${esc(bgLabel)}</strong></span>
+        </div>
+        <button class="btn btn-sm" id="btn-inputs-settings">تعديل</button>
+      </div>
+
+      <div id="inputs-missing-callout">
+        ${state.inputsMissingList ? `
+          <div class="alert alert-warning" style="margin-top:14px;margin-bottom:0">
+            <div>
+              <strong>لا يمكن بدء التشغيل التلقائي بعد — ينقص:</strong>
+              <span style="margin-inline-start:6px">${esc(state.inputsMissingList.join("، "))}</span>
+            </div>
+          </div>
+        ` : ""}
+      </div>
+
       <div class="action-footer">
-        <button class="btn" id="btn-manual-transcribe">التفريغ والمراجعة اليدوية</button>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <button class="btn" id="btn-manual-match">مطابقة ومراجعة نقاط القص</button>
+          <span class="field-hint" style="margin:0">مفيش حاجة بتشتغل قبل ما تدوس</span>
+        </div>
         <button class="btn btn-primary btn-lg" id="btn-auto-run">ابدأ التشغيل التلقائي</button>
       </div>
     `;
 
-    document.getElementById("btn-inputs-settings").onclick = openSettingsModal;
+    // Bind waveform on audio card
+    if (hasAudio) {
+      const aEl = document.getElementById("inputs-audio-player");
+      bindWaveform("inputs-waveform-canvas", aEl, `/api/projects/${p.id}/audio`);
+    }
 
-    // Audio upload & drag/drop
+    // Bind problem report inside unknown_format card if present
+    const unkRepBtn = document.getElementById("btn-unknown-copy-report");
+    if (unkRepBtn) unkRepBtn.onclick = copyProblemReport;
+
+    document.getElementById("btn-inputs-settings").onclick = openSettingsModal;
+    document.getElementById("btn-inputs-cuts-screen").onclick = () => navigate("cuts");
+
+    // Editable Project Name
+    const nameInp = document.getElementById("proj-name-input");
+    let nameTimer = null;
+    const saveName = async () => {
+      const val = nameInp.value.trim();
+      if (!val || val === p.name) return;
+      const res = await apiJson(`/api/projects/${p.id}`, "PATCH", { name: val });
+      state.project = res.project;
+      updateChrome();
+      markSaved();
+    };
+    nameInp.oninput = () => {
+      clearTimeout(nameTimer);
+      nameTimer = setTimeout(saveName, 450);
+    };
+    nameInp.onblur = saveName;
+
+    // Quick Folder handlers
+    const qfBtnPath = document.getElementById("btn-toggle-quick-path");
+    qfBtnPath.onclick = () => {
+      state.showQuickPathBox = !state.showQuickPathBox;
+      render();
+    };
+
+    const applyPathBtn = document.getElementById("btn-apply-quick-path");
+    if (applyPathBtn) {
+      applyPathBtn.onclick = async () => {
+        const fpath = document.getElementById("quick-folder-path-input").value.trim();
+        if (!fpath) return;
+        try {
+          toast("جاري فحص المجلد وتعبئة المواد...", "info");
+          const res = await apiJson(`/api/projects/${p.id}/quick-folder`, "POST", { folder_path: fpath });
+          state.project = res.project;
+          if (res.transcript) state.transcript = res.transcript;
+          if (state.project.raw_text) {
+            state.parsedPreview = await apiJson(`/api/projects/${p.id}/parse-text`, "POST", { raw_text: state.project.raw_text });
+          }
+          state.showQuickPathBox = false;
+          markSaved();
+          toast("تمت تعبئة المواد من المجلد بنجاح!", "success");
+          render();
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      };
+    }
+
+    const runQuickUpload = async (entries) => {
+      if (!entries.length) return;
+      const fd = new FormData();
+      entries.forEach(({ file, relpath }) => fd.append("files", file, relpath));
+      toast("جاري فرز ملفات المجلد وتعبئة البطاقات...", "info");
+      try {
+        const res = await api(`/api/projects/${p.id}/quick-folder`, { method: "POST", body: fd });
+        state.project = res.project;
+        if (res.transcript) state.transcript = res.transcript;
+        if (state.project.raw_text) {
+          state.parsedPreview = await apiJson(`/api/projects/${p.id}/parse-text`, "POST", { raw_text: state.project.raw_text });
+        }
+        state.inputsMissingList = null;
+        markSaved();
+        toast("تم استيراد المواد من المجلد بنجاح ✓", "success");
+        render();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+
+    const qfInput = document.getElementById("quick-folder-input");
+    qfInput.onchange = (e) => {
+      const files = Array.from(e.target.files || []).map((f) => ({ file: f, relpath: f.webkitRelativePath || f.name }));
+      runQuickUpload(files);
+    };
+    const qfDz = document.getElementById("quick-folder-dz");
+    qfDz.onclick = () => qfInput.click();
+    qfDz.ondragover = (e) => { e.preventDefault(); qfDz.classList.add("dragover"); };
+    qfDz.ondragleave = () => qfDz.classList.remove("dragover");
+    qfDz.ondrop = async (e) => {
+      e.preventDefault();
+      qfDz.classList.remove("dragover");
+      const items = await extractFilesFromDataTransfer(e.dataTransfer);
+      runQuickUpload(items);
+    };
+
+    // Audio upload
     const audioDz = document.getElementById("audio-dropzone");
     const audioInput = document.getElementById("audio-file-input");
     const handleAudioFile = async (file) => {
@@ -600,6 +1117,8 @@
       try {
         const res = await api(`/api/projects/${p.id}/audio`, { method: "POST", body: fd });
         state.project = res.project;
+        state.companions = res.companions || null;
+        state.inputsMissingList = null;
         markSaved();
         toast("تم تحميل ملف الصوت بنجاح.", "success");
         render();
@@ -616,7 +1135,82 @@
       if (e.dataTransfer.files[0]) handleAudioFile(e.dataTransfer.files[0]);
     };
 
-    // Scenes folder scan & drag/drop
+    const applyCompBtn = document.getElementById("btn-apply-companions");
+    if (applyCompBtn && companion) {
+      applyCompBtn.onclick = async () => {
+        try {
+          if (companion.transcript_path) {
+            await performTranscriptUpload({ localPath: companion.transcript_path });
+          }
+          if (companion.script_path) {
+            const sRes = await apiJson(`/api/projects/${p.id}/import-script-file`, "POST", { local_path: companion.script_path });
+            state.project = sRes.project;
+            state.parsedPreview = sRes;
+          }
+          state.companions = null;
+          markSaved();
+          toast("تم تطبيق الملفات المجاورة.", "success");
+          render();
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      };
+    }
+
+    // Transcript card upload
+    const trDz = document.getElementById("tr-card-dropzone");
+    const trInp = document.getElementById("tr-card-file-input");
+    trInp.onchange = (e) => {
+      if (e.target.files[0]) performTranscriptUpload({ file: e.target.files[0] });
+    };
+    trDz.ondragover = (e) => { e.preventDefault(); trDz.classList.add("dragover"); };
+    trDz.ondragleave = () => trDz.classList.remove("dragover");
+    trDz.ondrop = (e) => {
+      e.preventDefault();
+      trDz.classList.remove("dragover");
+      if (e.dataTransfer.files[0]) performTranscriptUpload({ file: e.dataTransfer.files[0] });
+    };
+
+    // Script .txt loader + live parsing
+    document.getElementById("script-txt-input").onchange = async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      const fd = new FormData();
+      fd.append("file", f);
+      try {
+        const res = await api(`/api/projects/${p.id}/import-script-file`, { method: "POST", body: fd });
+        state.project = res.project;
+        state.parsedPreview = res;
+        state.inputsMissingList = null;
+        markSaved();
+        toast(`تم تحميل ${res.segments.length} مقطع من ملف النص.`, "success");
+        render();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+
+    let parseTimer = null;
+    const rawTextEl = document.getElementById("raw-text-input");
+    rawTextEl.oninput = () => {
+      state.project.raw_text = rawTextEl.value;
+      clearTimeout(parseTimer);
+      parseTimer = setTimeout(async () => {
+        try {
+          const res = await apiJson(`/api/projects/${p.id}/parse-text`, "POST", { raw_text: rawTextEl.value });
+          state.parsedPreview = res;
+          markSaved();
+          document.getElementById("parsed-seg-count").textContent = `${res.segments.length} مقطع`;
+          document.getElementById("text-warnings-box").innerHTML = (res.warnings || [])
+            .map((w) => `<div class="alert alert-warning" style="margin-bottom:6px">${esc(w)}</div>`)
+            .join("");
+        } catch {
+          // ignore typing transient
+        }
+      }, 320);
+    };
+
+    // Scenes folder scan & drop
     const scenesDirInput = document.getElementById("scenes-dir-input");
     document.getElementById("btn-pick-folder").onclick = async () => {
       try {
@@ -624,9 +1218,11 @@
         if (res.path) {
           scenesDirInput.value = res.path;
           document.getElementById("btn-scan-scenes").click();
+        } else if (res.error) {
+          toast(res.error, "info");
         }
       } catch (err) {
-        toast(err.message || "يمكنك لصق المسار أو سحب الملفات وإفلاتها.", "info");
+        toast(err.message, "info");
       }
     };
 
@@ -634,7 +1230,7 @@
       try {
         const scanRes = await apiJson(`/api/projects/${p.id}/scan-scenes`, "POST", {
           scenes_dir: scenesDirInput.value.trim(),
-          raw_text: document.getElementById("raw-text-input").value,
+          raw_text: rawTextEl.value,
         });
         state.project.scenes_dir = scenesDirInput.value.trim();
         state.project.scenes_scan = scanRes;
@@ -671,160 +1267,356 @@
       handleScenesFiles(e.dataTransfer.files);
     };
 
-    // Live script parsing (debounced)
-    let parseTimer = null;
-    const rawTextEl = document.getElementById("raw-text-input");
-    rawTextEl.oninput = () => {
-      state.project.raw_text = rawTextEl.value;
-      clearTimeout(parseTimer);
-      parseTimer = setTimeout(async () => {
-        try {
-          const res = await apiJson(`/api/projects/${p.id}/parse-text`, "POST", {
-            raw_text: rawTextEl.value,
-          });
-          state.parsedPreview = res;
-          markSaved();
-          document.getElementById("parsed-seg-count").textContent = `${res.segments.length} مقطع مكتشف`;
-          document.getElementById("text-warnings-box").innerHTML = (res.warnings || [])
-            .map((w) => `<div class="alert alert-warning" style="margin-bottom:8px">${esc(w)}</div>`)
-            .join("");
-        } catch {
-          // ignore transient typing
-        }
-      }, 320);
-    };
+    // Start Run (only on explicit button press)
+    const runMatch = async (autoMode) => {
+      const missing = [];
+      if (!state.project.audio_path) missing.push("ملف الصوت");
+      if (!state.transcript || !state.transcript.segments?.length) missing.push("ملف التفريغ (JSON / SRT / VTT)");
+      if (!rawTextEl.value.trim()) missing.push("النص المرقّم (1..N)");
+      if (state.project.scenes_scan?.ok === false && state.project.scenes_scan?.conflicts?.length) {
+        missing.push("حل تعارض أرقام المشاهد");
+      }
+      if (missing.length) {
+        state.inputsMissingList = missing;
+        toast(`ينقص: ${missing.join("، ")}`, "warning");
+        render();
+        return;
+      }
+      state.inputsMissingList = null;
 
-    const startPipeline = async (autoMode) => {
-      if (!state.project.audio_path) {
-        toast("يرجى اختيار ملف الصوت أولاً.", "warning");
-        return;
-      }
-      if (!rawTextEl.value.trim()) {
-        toast("يرجى لصق النص المرقم أولاً.", "warning");
-        return;
-      }
-      if (state.project.scenes_scan && state.project.scenes_scan.ok === false && state.project.scenes_scan.conflicts?.length) {
-        toast("يرجى حل تعارض أسماء ملفات المشاهد أولاً.", "error");
-        return;
-      }
       try {
-        state.autoPendingExport = autoMode;
-        const res = await apiJson(`/api/projects/${p.id}/transcribe-and-match`, "POST", {
+        const res = await apiJson(`/api/projects/${p.id}/match-cuts`, "POST", {
           raw_text: rawTextEl.value,
           scenes_dir: scenesDirInput.value.trim(),
           auto_mode: autoMode,
         });
-        state.activeJob = { id: res.job_id, status: "running", progress: 2, message: "جاري بدء التفريغ..." };
-        renderLiveBanner();
-        startJobPolling(res.job_id, async (job) => {
-          state.cuts = job.cuts;
-          state.timeline = job.timeline;
-          if (job.scenes_scan) state.project.scenes_scan = job.scenes_scan;
-          markSaved();
-          if (autoMode) {
-            toast("اكتمل التفريغ والقص وتركيب المشاهد! حدد الحركات على الصور الآن.", "success");
-            await navigate("motion");
-          } else {
-            toast("اكتمل التفريغ والمطابقة. يمكنك مراجعة نقاط القص.", "success");
-            await navigate("cuts");
-          }
-        });
+        state.project = res.project;
+        state.cuts = res.cuts;
+        state.timeline = res.timeline;
+        if (res.scenes_scan) state.project.scenes_scan = res.scenes_scan;
+        markSaved();
+        if (autoMode) {
+          toast("تمت المطابقة وتركيب المشاهد! حدد الحركات على الصور الآن.", "success");
+          await navigate("motion");
+        } else {
+          toast("تم بناء نقاط القص! يمكنك مراجعتها وتعديلها.", "success");
+          state.cutsSubTab = "cuts";
+          await navigate("cuts");
+        }
       } catch (err) {
         toast(err.message, "error");
       }
     };
 
-    document.getElementById("btn-auto-run").onclick = () => startPipeline(true);
-    document.getElementById("btn-manual-transcribe").onclick = () => startPipeline(false);
+    document.getElementById("btn-auto-run").onclick = () => runMatch(true);
+    document.getElementById("btn-manual-match").onclick = () => runMatch(false);
   }
 
-  // ---------- Screen 2: Cuts Review ----------
+  // ---------- Screen 2: "التفريغ (استيراد)" & Cuts Review ----------
   function renderCuts(outlet) {
     const p = state.project;
+    const tr = state.transcript;
     const segs = state.cuts?.segments || [];
+    const trSegs = tr?.segments || [];
+    const suspiciousOnly = state.transcriptFilter === "suspicious";
+    const visibleTrSegs = suspiciousOnly ? trSegs.filter((s) => s.suspicious_reasons?.length) : trSegs;
 
-    if (!segs.length) {
-      outlet.innerHTML = `
-        <div class="empty-state">
-          <div class="empty-icon">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+    const precisionBanner = tr
+      ? `<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <strong class="ltr-name mono">${esc(tr.filename)}</strong>
+            <span class="precision-badge ${tr.precision === "word" ? "precision-word" : "precision-sentence"}">${esc(tr.format_label)}</span>
           </div>
-          <h3>لا توجد نقاط قص بعد</h3>
-          <p style="color:var(--text-muted);margin-bottom:18px">ابدأ بتفريغ الصوت ومطابقة النص من شاشة المدخلات.</p>
-          <button class="btn btn-primary" id="btn-back-inputs">العودة إلى المدخلات</button>
+          ${tr.precision_hint ? `<span style="font-size:12.5px;color:var(--warning-text);font-weight:600">${esc(tr.precision_hint)}</span>` : ""}
+        </div>`
+      : "";
+
+    const statsStripHtml = tr
+      ? `<div class="stats-strip">
+          <div class="stat-chip">
+            <div class="stat-label">التغطية</div>
+            <div class="stat-value tabular">${tr.coverage_pct ?? 0}%</div>
+          </div>
+          <div class="stat-chip">
+            <div class="stat-label">السطور / الكلمات</div>
+            <div class="stat-value tabular">${tr.stats?.segment_count || 0} <span style="font-size:13px;color:var(--text-2)">(${tr.stats?.word_count || 0} كلمة)</span></div>
+          </div>
+          <div class="stat-chip">
+            <div class="stat-label">آخر توقيت / مدة الصوت</div>
+            <div class="stat-value mono" style="font-size:17px">${fmtTime(tr.last_timestamp)} / ${fmtTime(p.audio_duration || tr.duration)}</div>
+          </div>
+          <div class="stat-chip">
+            <div class="stat-label">سطور مشبوهة</div>
+            <div class="stat-value tabular" style="color:${(tr.stats?.suspicious_count || 0) > 0 ? "var(--warning-text)" : "var(--success-text)"}">${tr.stats?.suspicious_count || 0}</div>
+          </div>
+        </div>`
+      : "";
+
+    let bodyHtml = "";
+    if (!tr) {
+      bodyHtml = `
+        <div class="empty-state">
+          <div class="empty-icon">📄</div>
+          <h3>لم يتم استيراد ملف تفريغ بعد</h3>
+          <p style="color:var(--text-2);margin-bottom:14px">اسحب ملف <span class="mono">JSON</span> أو <span class="mono">SRT</span> أو <span class="mono">VTT</span> من الأعلى، أو الصق المحتوى مباشرة.</p>
         </div>`;
-      document.getElementById("btn-back-inputs").onclick = () => navigate("inputs");
-      return;
+    } else if (state.cutsSubTab === "preview") {
+      bodyHtml = `
+        <div class="transcript-toolbar">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button class="btn btn-sm ${!suspiciousOnly ? "btn-primary" : ""}" id="btn-tr-filter-all">الكل (${trSegs.length})</button>
+            <button class="btn btn-sm ${suspiciousOnly ? "btn-primary" : ""}" id="btn-tr-filter-susp">المشبوهة فقط (${tr.stats?.suspicious_count || 0})</button>
+          </div>
+          <div class="field-hint" style="margin:0">انقر على أي سطر لتشغيل الصوت من توقيته فوراً</div>
+        </div>
+
+        <div class="transcript-list">
+          ${visibleTrSegs.length ? visibleTrSegs.map((s) => {
+            const isSusp = Boolean(s.suspicious_reasons?.length);
+            const isIgn = Boolean(s.ignored);
+            const cls = `${isSusp ? "suspicious" : ""} ${isIgn ? "ignored" : ""}`.trim();
+            return `<div class="transcript-row ${cls}" data-tr-play="${Number(s.start)}">
+              <span class="mono" style="font-size:12px;color:var(--text-2)">#${s.index}</span>
+              <span class="mono" style="font-size:12px">${fmtTime(s.start)} → ${fmtTime(s.end)}</span>
+              <div>
+                <div style="font-size:14px">${esc(s.text)}</div>
+                ${isSusp ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">${(s.suspicious_labels || []).map((lbl) => `<span class="est-badge">${esc(lbl)}</span>`).join("")}</div>` : ""}
+              </div>
+              <div onclick="event.stopPropagation()">
+                ${isSusp || isIgn ? `
+                  <button class="btn btn-sm ${isIgn ? "" : "btn-danger"}" data-toggle-ign="${s.index}">
+                    ${isIgn ? "إلغاء التجاهل" : "تجاهل هذا السطر"}
+                  </button>
+                ` : ""}
+              </div>
+            </div>`;
+          }).join("") : `<div style="padding:24px;text-align:center;color:var(--text-2)">لا توجد سطور مشبوهة ✓</div>`}
+        </div>
+      `;
+    } else {
+      bodyHtml = segs.length ? `
+        <div class="table-wrap">
+          <table class="cuts-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>النص المدخل</th>
+                <th>النص المطابق</th>
+                <th>البداية (ثانية)</th>
+                <th>النهاية</th>
+                <th>المدة</th>
+                <th>الدقة</th>
+                <th>تشغيل / ضبط</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${segs.map((s, idx) => {
+                const conf = Number(s.confidence || 0);
+                const isUnmatched = !s.matched;
+                const rowCls = isUnmatched ? "row-bad" : conf < 68 ? "row-warn" : "";
+                const badgeCls = isUnmatched || conf < 55 ? "conf-low" : conf < 75 ? "conf-mid" : "conf-high";
+                const badgeTxt = isUnmatched ? "غير متطابق" : `${Math.round(conf)}%`;
+                const estTag = s.estimated ? `<span class="est-badge" title="مطابقة داخل سطر جملة بتقدير نسبي">تقدير</span>` : "";
+                return `<tr class="${rowCls}" data-seg-row="${s.id}">
+                  <td class="tabular" style="font-weight:700">${s.id}</td>
+                  <td style="max-width:230px">${esc(s.text)}</td>
+                  <td style="max-width:230px;color:var(--text-2)">${isUnmatched ? `<span style="color:var(--danger-text)">غير متطابق</span>` : esc(s.matched_text)}</td>
+                  <td>
+                    <div class="time-edit-group">
+                      <button class="btn btn-sm btn-icon" data-nudge="-0.1" data-seg="${s.id}" ${idx === 0 ? "disabled" : ""} title="-0.1 ثانية">-</button>
+                      <input class="time-input" type="number" step="0.1" min="0" value="${Number(s.start).toFixed(2)}" data-start-input="${s.id}" ${idx === 0 ? "disabled" : ""} />
+                      <button class="btn btn-sm btn-icon" data-nudge="0.1" data-seg="${s.id}" ${idx === 0 ? "disabled" : ""} title="+0.1 ثانية">+</button>
+                    </div>
+                  </td>
+                  <td class="mono">${fmtTime(s.end)}</td>
+                  <td class="mono">${Number(s.duration).toFixed(2)}s</td>
+                  <td><span class="conf-badge ${badgeCls} tabular">${badgeTxt}</span>${estTag}</td>
+                  <td>
+                    <div style="display:flex;gap:6px">
+                      <button class="btn btn-sm" data-play-from="${Math.max(0, Number(s.start) - 1.0)}" title="تشغيل قبل البداية بثانية">▶ -1ث</button>
+                      ${idx > 0 ? `<button class="btn btn-sm" data-stamp-here="${s.id}" title="ضبط البداية عند موضع الصوت الحالي">ابدأ هنا</button>` : ""}
+                    </div>
+                  </td>
+                </tr>`;
+              }).join("")}
+            </tbody>
+          </table>
+        </div>
+      ` : `
+        <div class="empty-state">
+          <h3>لم يتم حساب نقاط القص بعد</h3>
+          <p style="color:var(--text-2);margin-bottom:16px">تأكد من كتابة النص المرقّم في المدخلات ثم اضغط «مطابقة وبناء نقاط القص».</p>
+          <button class="btn btn-primary" id="btn-run-match-empty">مطابقة وبناء نقاط القص</button>
+        </div>
+      `;
     }
 
     outlet.innerHTML = `
       <div class="section-header">
         <div>
-          <h1 class="section-title">2. مراجعة التفريغ ونقاط القص</h1>
-          <p class="section-subtitle">يمكنك سماع أي مقطع قبل بدايته بثانية أو تعديل وقت البداية مباشرة وسيتم تحديث المقطع السابق تلقائياً.</p>
+          <h1 class="section-title">2. التفريغ (استيراد) ونقاط القص</h1>
+          <p class="section-subtitle">استورد تفريغ Vibe أو Whisper، راجع السطور المشبوهة، واضبط نقاط القص بدقة.</p>
         </div>
-        <button class="btn btn-primary btn-lg" id="btn-save-cuts-next">حفظ ومتابعة</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" id="btn-cuts-rematch">مطابقة وبناء نقاط القص</button>
+          <button class="btn btn-primary btn-lg" id="btn-save-cuts-next">حفظ ومتابعة</button>
+        </div>
       </div>
 
-      <div class="audio-bar">
-        <audio id="cuts-audio-player" controls src="/api/projects/${esc(p.id)}/audio"></audio>
-        <span class="mono" id="cuts-playhead" style="font-size:13px;color:var(--accent)">00:00.0</span>
-      </div>
+      <!-- External Transcript Import Card -->
+      <section class="card" style="margin-bottom:16px;padding:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <div class="dropzone" id="cuts-tr-dropzone" style="flex:1;min-width:260px;padding:12px">
+            <input type="file" id="cuts-tr-file-input" accept=".json,.srt,.vtt,text/plain" />
+            <div style="font-weight:600;font-size:13.5px">استيراد ملف تفريغ جديد (<span class="mono">Vibe JSON / whisper.cpp JSON / OpenAI JSON / SRT / VTT</span>)</div>
+          </div>
+          <button class="btn btn-sm" id="btn-toggle-paste-tr">${state.showPasteBox ? "إخفاء صندوق اللصق" : "لصق النص مباشرة"}</button>
+        </div>
 
-      <div class="table-wrap">
-        <table class="cuts-table">
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>النص المدخل</th>
-              <th>النص المطابق في الصوت</th>
-              <th>البداية (ثانية)</th>
-              <th>النهاية</th>
-              <th>المدة</th>
-              <th>الدقة</th>
-              <th>تشغيل / ضبط</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${segs.map((s, idx) => {
-              const conf = Number(s.confidence || 0);
-              const isUnmatched = !s.matched;
-              const rowCls = isUnmatched ? "row-bad" : conf < 68 ? "row-warn" : "";
-              const badgeCls = isUnmatched || conf < 55 ? "conf-low" : conf < 75 ? "conf-mid" : "conf-high";
-              const badgeTxt = isUnmatched ? "غير متطابق" : `${Math.round(conf)}%`;
-              return `<tr class="${rowCls}" data-seg-row="${s.id}">
-                <td class="tabular" style="font-weight:700">${s.id}</td>
-                <td style="max-width:240px">${esc(s.text)}</td>
-                <td style="max-width:240px;color:var(--text-muted)">${isUnmatched ? `<span style="color:var(--error)">غير متطابق</span>` : esc(s.matched_text)}</td>
-                <td>
-                  <div class="time-edit-group">
-                    <button class="btn btn-sm btn-icon" data-nudge="-0.1" data-seg="${s.id}" ${idx === 0 ? "disabled" : ""} title="-0.1 ثانية">-</button>
-                    <input class="time-input" type="number" step="0.1" min="0" value="${Number(s.start).toFixed(2)}" data-start-input="${s.id}" ${idx === 0 ? "disabled" : ""} />
-                    <button class="btn btn-sm btn-icon" data-nudge="0.1" data-seg="${s.id}" ${idx === 0 ? "disabled" : ""} title="+0.1 ثانية">+</button>
-                  </div>
-                </td>
-                <td class="mono">${fmtTime(s.end)}</td>
-                <td class="mono">${Number(s.duration).toFixed(2)}s</td>
-                <td><span class="conf-badge ${badgeCls} tabular">${badgeTxt}</span></td>
-                <td>
-                  <div style="display:flex;gap:6px">
-                    <button class="btn btn-sm" data-play-from="${Math.max(0, Number(s.start) - 1.0)}" title="تشغيل قبل البداية بثانية">▶ -1ث</button>
-                    ${idx > 0 ? `<button class="btn btn-sm" data-stamp-here="${s.id}" title="ضبط البداية عند موضع الصوت الحالي">ابدأ هنا</button>` : ""}
-                  </div>
-                </td>
-              </tr>`;
-            }).join("")}
-          </tbody>
-        </table>
-      </div>
+        ${state.showPasteBox ? `
+          <div style="margin-top:12px">
+            <textarea class="textarea mono" id="paste-tr-textarea" style="min-height:140px;direction:ltr;text-align:left" placeholder="الصق محتوى JSON أو SRT أو VTT هنا..."></textarea>
+            <div style="display:flex;justify-content:flex-end;margin-top:8px">
+              <button class="btn btn-primary btn-sm" id="btn-submit-paste-tr">تحليل واستيراد النص</button>
+            </div>
+          </div>
+        ` : ""}
+
+        ${precisionBanner}
+        ${renderImportErrorHtml(state.transcriptImportError)}
+      </section>
+
+      ${statsStripHtml}
+
+      ${p.audio_path ? `
+        <div class="audio-bar">
+          <canvas class="waveform-canvas" id="cuts-waveform-canvas" height="42"></canvas>
+          <div class="audio-bar-top">
+            <audio id="cuts-audio-player" controls src="/api/projects/${esc(p.id)}/audio"></audio>
+            <span class="mono" id="cuts-playhead" style="font-size:13px;color:var(--accent)">00:00.0</span>
+          </div>
+        </div>
+      ` : ""}
+
+      ${tr ? `
+        <div class="segmented-tabs" style="margin-bottom:14px">
+          <button class="seg-tab ${state.cutsSubTab === "preview" ? "active" : ""}" data-cutstab="preview">
+            معاينة التفريغ (${trSegs.length})
+          </button>
+          <button class="seg-tab ${state.cutsSubTab === "cuts" ? "active" : ""}" data-cutstab="cuts">
+            نقاط القص (${segs.length})
+          </button>
+        </div>
+      ` : ""}
+
+      ${bodyHtml}
     `;
 
-    const audioEl = document.getElementById("cuts-audio-player");
-    const playheadEl = document.getElementById("cuts-playhead");
-    audioEl.ontimeupdate = () => {
-      playheadEl.textContent = fmtTime(audioEl.currentTime);
+    // Unknown format report button
+    const unkBtn = document.getElementById("btn-unknown-copy-report");
+    if (unkBtn) unkBtn.onclick = copyProblemReport;
+
+    // Import dropzone & paste box
+    const cutsDz = document.getElementById("cuts-tr-dropzone");
+    const cutsInp = document.getElementById("cuts-tr-file-input");
+    cutsInp.onchange = (e) => {
+      if (e.target.files[0]) performTranscriptUpload({ file: e.target.files[0] });
+    };
+    cutsDz.ondragover = (e) => { e.preventDefault(); cutsDz.classList.add("dragover"); };
+    cutsDz.ondragleave = () => cutsDz.classList.remove("dragover");
+    cutsDz.ondrop = (e) => {
+      e.preventDefault();
+      cutsDz.classList.remove("dragover");
+      if (e.dataTransfer.files[0]) performTranscriptUpload({ file: e.dataTransfer.files[0] });
     };
 
+    document.getElementById("btn-toggle-paste-tr").onclick = () => {
+      state.showPasteBox = !state.showPasteBox;
+      render();
+    };
+    const subPasteBtn = document.getElementById("btn-submit-paste-tr");
+    if (subPasteBtn) {
+      subPasteBtn.onclick = () => {
+        const txt = document.getElementById("paste-tr-textarea").value;
+        performTranscriptUpload({ text: txt, filename: "pasted_transcript.txt" });
+      };
+    }
+
+    // Subtabs & Filters
+    outlet.querySelectorAll("[data-cutstab]").forEach((btn) => {
+      btn.onclick = () => {
+        state.cutsSubTab = btn.dataset.cutstab;
+        render();
+      };
+    });
+
+    const fAll = document.getElementById("btn-tr-filter-all");
+    const fSusp = document.getElementById("btn-tr-filter-susp");
+    if (fAll) fAll.onclick = () => { state.transcriptFilter = "all"; render(); };
+    if (fSusp) fSusp.onclick = () => { state.transcriptFilter = "suspicious"; render(); };
+
+    // Audio player + Waveform
+    const audioEl = document.getElementById("cuts-audio-player");
+    const playheadEl = document.getElementById("cuts-playhead");
+    if (audioEl) {
+      audioEl.ontimeupdate = () => {
+        if (playheadEl) playheadEl.textContent = fmtTime(audioEl.currentTime);
+      };
+      bindWaveform("cuts-waveform-canvas", audioEl, `/api/projects/${p.id}/audio`);
+    }
+
+    // Transcript preview click-to-play & ignore toggle
+    outlet.querySelectorAll("[data-tr-play]").forEach((row) => {
+      row.onclick = () => {
+        if (audioEl) {
+          audioEl.currentTime = Number(row.dataset.trPlay) || 0;
+          audioEl.play().catch(() => {});
+        }
+      };
+    });
+
+    outlet.querySelectorAll("[data-toggle-ign]").forEach((btn) => {
+      btn.onclick = async () => {
+        const idx = Number(btn.dataset.toggleIgn);
+        const curIgn = new Set((tr.segments || []).filter((x) => x.ignored).map((x) => Number(x.index)));
+        if (curIgn.has(idx)) curIgn.delete(idx);
+        else curIgn.add(idx);
+        try {
+          const res = await apiJson(`/api/projects/${p.id}/transcript/ignored`, "POST", {
+            ignored_indices: Array.from(curIgn),
+          });
+          state.transcript = res.transcript;
+          if (res.cuts) state.cuts = res.cuts;
+          if (res.timeline) state.timeline = res.timeline;
+          markSaved();
+          toast("تم تحديث حالة السطر.", "success");
+          render();
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      };
+    });
+
+    // Rematch cuts action
+    const doMatchCuts = async () => {
+      try {
+        const res = await apiJson(`/api/projects/${p.id}/match-cuts`, "POST", { auto_mode: false });
+        state.project = res.project;
+        state.cuts = res.cuts;
+        state.timeline = res.timeline;
+        state.cutsSubTab = "cuts";
+        markSaved();
+        toast("تم بناء نقاط القص بنجاح.", "success");
+        render();
+      } catch (err) {
+        toast(err.message, "error");
+      }
+    };
+    document.getElementById("btn-cuts-rematch").onclick = doMatchCuts;
+    const emptyMatchBtn = document.getElementById("btn-run-match-empty");
+    if (emptyMatchBtn) emptyMatchBtn.onclick = doMatchCuts;
+
+    // Cuts table controls
     const applyNewStart = async (segId, newStart) => {
       try {
         const res = await apiJson(`/api/projects/${p.id}/cuts/${segId}/start`, "POST", { start: newStart });
@@ -839,8 +1631,10 @@
 
     outlet.querySelectorAll("[data-play-from]").forEach((btn) => {
       btn.onclick = () => {
-        audioEl.currentTime = Number(btn.dataset.playFrom) || 0;
-        audioEl.play();
+        if (audioEl) {
+          audioEl.currentTime = Number(btn.dataset.playFrom) || 0;
+          audioEl.play().catch(() => {});
+        }
       };
     });
 
@@ -861,11 +1655,15 @@
 
     outlet.querySelectorAll("[data-stamp-here]").forEach((btn) => {
       btn.onclick = () => {
-        applyNewStart(Number(btn.dataset.stampHere), audioEl.currentTime);
+        if (audioEl) applyNewStart(Number(btn.dataset.stampHere), audioEl.currentTime);
       };
     });
 
     document.getElementById("btn-save-cuts-next").onclick = async () => {
+      if (!state.cuts) {
+        await doMatchCuts();
+        return;
+      }
       try {
         const res = await apiJson(`/api/projects/${p.id}/cuts`, "PUT", { cuts: state.cuts, stage: "scenes" });
         state.cuts = res.cuts;
@@ -890,7 +1688,7 @@
         <div class="empty-state">
           <div class="empty-icon">🎬</div>
           <h3>لم يتم تركيب المشاهد على الخط الزمني بعد</h3>
-          <p style="color:var(--text-muted);margin-bottom:18px">تأكد من اختيار مجلد المشاهد وإتمام التفريغ والقص أولاً.</p>
+          <p style="color:var(--text-2);margin-bottom:18px">تأكد من اختيار مجلد المشاهد وإتمام استيراد التفريغ ونقاط القص أولاً.</p>
           <button class="btn btn-primary" id="btn-sc-inputs">الذهاب للمدخلات</button>
         </div>`;
       document.getElementById("btn-sc-inputs").onclick = () => navigate("inputs");
@@ -915,14 +1713,14 @@
         <div class="stat-card"><div class="stat-label">الصور</div><div class="stat-value tabular">${imgCount}</div></div>
         <div class="stat-card"><div class="stat-label">مقاطع الفيديو (صامتة)</div><div class="stat-value tabular">${vidCount}</div></div>
         <div class="stat-card"><div class="stat-label">المدة الكلية</div><div class="stat-value mono">${fmtDur(tl.video_duration)}</div></div>
-        ${missCount ? `<div class="stat-card"><div class="stat-label" style="color:var(--warning)">مشاهد مفقودة</div><div class="stat-value tabular" style="color:var(--warning)">${missCount}</div></div>` : ""}
+        ${missCount ? `<div class="stat-card"><div class="stat-label" style="color:var(--warning-text)">مشاهد مفقودة</div><div class="stat-value tabular" style="color:var(--warning-text)">${missCount}</div></div>` : ""}
       </div>
 
       <div class="scenes-grid">
         ${items.map((it) => {
           const thumbHtml = it.thumbnail_url
             ? `<img src="${esc(it.thumbnail_url)}" alt="مشهد ${it.segment_id}" />`
-            : `<span style="color:var(--text-muted);font-size:12px">${it.scene_type === "missing" ? "مشهد مفقود" : "معاينة"}</span>`;
+            : `<span style="color:var(--text-2);font-size:12px">${it.scene_type === "missing" ? "مشهد مفقود" : "معاينة"}</span>`;
           const typeLabel = it.scene_type === "video" ? `فيديو · ${Number(it.speed).toFixed(2)}x` : it.scene_type === "image" ? "صورة" : "مفقود";
           return `<article class="scene-card" data-preview-seg="${it.segment_id}">
             <div class="scene-thumb-box">
@@ -934,7 +1732,7 @@
                 <span>${typeLabel}</span>
                 <span class="mono">${Number(it.duration).toFixed(2)}s</span>
               </div>
-              <div class="field-hint" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span dir="ltr" style="unicode-bidi:isolate">${esc(it.scene_filename || "بدون ملف")}</span></div>
+              <div class="field-hint" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis"><span class="ltr-name">${esc(it.scene_filename || "بدون ملف")}</span></div>
               ${it.speed_badge ? `<span class="speed-warning-tag">${esc(it.speed_badge)}</span>` : ""}
             </div>
           </article>`;
@@ -974,7 +1772,7 @@
     document.getElementById("btn-scenes-next").onclick = () => navigate("motion");
   }
 
-  // ---------- Screen 4: Motion Studio (§5 & §11) ----------
+  // ---------- Screen 4: Motion Studio ----------
   function getImageItems() {
     return (state.timeline?.items || []).filter((it) => it.scene_type === "image");
   }
@@ -990,9 +1788,7 @@
     return imgs.filter((it) => {
       const a = assignments[String(it.segment_id)];
       if (!a || !a.type) return true;
-      const assignedTabIdx = getTabIndex(a.type);
-      // Never show images already assigned in an EARLIER tab!
-      return assignedTabIdx >= tabIdx;
+      return getTabIndex(a.type) >= tabIdx;
     });
   }
 
@@ -1014,7 +1810,7 @@
         <div class="empty-state">
           <div class="empty-icon">✨</div>
           <h3>لا توجد صور لتطبيق الحركات عليها</h3>
-          <p style="color:var(--text-muted);margin-bottom:18px">المشاهد الحالية عبارة عن مقاطع فيديو فقط (أو لم يتم تركيب المشاهد بعد). يمكنك التصدير مباشرة.</p>
+          <p style="color:var(--text-2);margin-bottom:18px">المشاهد الحالية عبارة عن مقاطع فيديو فقط (أو لم يتم تركيب المشاهد بعد). يمكنك التصدير مباشرة.</p>
           <button class="btn btn-primary btn-lg" id="btn-motion-skip-export">تنفيذ والتصدير</button>
         </div>`;
       document.getElementById("btn-motion-skip-export").onclick = triggerExport;
@@ -1025,7 +1821,6 @@
     const globalStrength = Number(state.motions.global_strength ?? 15);
     const eligible = getEligibleImagesForTab(state.motionTab);
 
-    // Pick valid current image inside eligible list (or allow empty state for tab if all assigned earlier)
     let currIdx = eligible.findIndex((x) => Number(x.segment_id) === Number(state.motionCurrentSegId));
     if (currIdx === -1 && eligible.length > 0) {
       currIdx = 0;
@@ -1073,7 +1868,7 @@
 
       ${currItem ? `
         <div class="motion-controls-bar">
-          <div class="meta-line" style="font-size:14px;color:var(--text-primary)">
+          <div class="meta-line" style="font-size:14px;color:var(--text)">
             <strong class="tabular">صورة ${currIdx + 1} من ${eligible.length}</strong>
             <span>·</span>
             <span>مشهد <strong class="tabular">#${currItem.segment_id}</strong></span>
@@ -1094,7 +1889,7 @@
               </label>
               <button class="btn btn-sm" id="btn-preview-motion">معاينة الحركة</button>
               <button class="btn btn-sm btn-danger" id="btn-clear-dot">مسح النقطة</button>
-            ` : `<span style="font-size:13px;color:var(--text-muted)">انقر على الصورة لتعيين حركة ${esc(state.motionTab)} أو انتقل للتالية لتركها ثابتة</span>`}
+            ` : `<span style="font-size:13px;color:var(--text-2)">انقر على الصورة لتعيين حركة ${esc(state.motionTab)} أو انتقل للتالية لتركها ثابتة</span>`}
           </div>
         </div>
 
@@ -1128,11 +1923,10 @@
       ` : `
         <div class="empty-state" style="margin-bottom:16px">
           <h3>تم تعيين حركات لجميع الصور في التبويبات السابقة ✓</h3>
-          <p style="color:var(--text-muted);margin-bottom:14px">يمكنك الضغط على أي صورة في الشريط أدناه لتعديل حركتها أو الضغط على تنفيذ الحركات والتصدير.</p>
+          <p style="color:var(--text-2);margin-bottom:14px">يمكنك الضغط على أي صورة في الشريط أدناه لتعديل حركتها أو الضغط على تنفيذ الحركات والتصدير.</p>
         </div>
       `}
 
-      <!-- Thumbnail strip of ALL images -->
       <div class="thumb-strip" id="motion-thumb-strip">
         ${allImages.map((it) => {
           const a = assignments[String(it.segment_id)];
@@ -1156,7 +1950,6 @@
       </div>
     `;
 
-    // Tab clicks
     outlet.querySelectorAll("[data-mtab]").forEach((btn) => {
       btn.onclick = () => {
         state.motionTab = btn.dataset.mtab;
@@ -1184,7 +1977,6 @@
     };
     gSlider.onchange = saveMotionsNow;
 
-    // Thumbnail strip click: jump to image (switching to its assigned tab if in an earlier tab)
     outlet.querySelectorAll("[data-strip-seg]").forEach((el) => {
       el.onclick = () => {
         const sid = Number(el.dataset.stripSeg);
@@ -1255,7 +2047,7 @@
         };
 
         stageBox.onclick = async (e) => {
-          if (e.target === dotEl) return; // handled below
+          if (e.target === dotEl) return;
           setPointFromClient(e.clientX, e.clientY, true);
           render();
           await saveMotionsNow();
@@ -1284,7 +2076,6 @@
             window.onmousemove = null;
             window.onmouseup = null;
             if (!movedDuringDrag) {
-              // Clicking the dot itself removes it (§5)
               delete assignments[sidKey];
               render();
             }
@@ -1344,7 +2135,6 @@
     }
   }
 
-  // Global keyboard shortcuts for Motion Screen
   window.addEventListener("keydown", async (e) => {
     if (state.view !== "motion" || !state.project) return;
     if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)) return;
@@ -1461,7 +2251,7 @@
               <div class="meta-line" style="justify-content:space-between"><span>إجمالي المقاطع</span><strong class="tabular">${rep.total_segments}</strong></div>
               <div class="meta-line" style="justify-content:space-between"><span>مدة الصوت الأصلي</span><strong class="mono">${rep.audio_duration}s</strong></div>
               <div class="meta-line" style="justify-content:space-between"><span>مدة الفيديو النهائي</span><strong class="mono">${rep.video_duration}s</strong></div>
-              <div class="meta-line" style="justify-content:space-between"><span>تطابق الطول</span><strong style="color:var(--success)">فرق <span class="mono">${rep.duration_diff}s</span></strong></div>
+              <div class="meta-line" style="justify-content:space-between"><span>تطابق الطول</span><strong style="color:var(--success-text)">فرق <span class="mono">${rep.duration_diff}s</span></strong></div>
               <div class="meta-line" style="justify-content:space-between"><span>مقاطع من الذاكرة المؤقتة (Cache)</span><strong class="tabular">${rep.cached_clips}</strong></div>
               <div class="meta-line" style="justify-content:space-between"><span>مقاطع مُصيّرة حديثاً</span><strong class="tabular">${rep.rendered_clips}</strong></div>
               <div class="meta-line" style="justify-content:space-between"><span>زمن التصدير</span><strong class="mono">${rep.export_time_seconds}s</strong></div>
@@ -1473,7 +2263,7 @@
         </div>`
       : `<div class="empty-state">
           <h3>جاهز للتصدير النهائي</h3>
-          <p style="color:var(--text-muted);margin-bottom:18px">سيتم تصيير كل مشهد بالتوازي مع حفظ الذاكرة المؤقتة ثم دمج الصوت الأصلي دون المساس به.</p>
+          <p style="color:var(--text-2);margin-bottom:18px">سيتم تصيير كل مشهد بالتوازي مع حفظ الذاكرة المؤقتة ثم دمج الصوت الأصلي دون المساس به.</p>
           <button class="btn btn-primary btn-lg" id="btn-start-export-now">بدء التصدير الآن</button>
         </div>`;
 
@@ -1522,7 +2312,7 @@
     if (gotoRev) gotoRev.onclick = () => navigate("review");
   }
 
-  // ---------- Screen 6: Post-Result Manual Control (§10b) ----------
+  // ---------- Screen 6: Post-Result Manual Review ----------
   function renderReview(outlet) {
     const p = state.project;
     const items = state.timeline?.items || [];
@@ -1558,7 +2348,7 @@
                 return `<div class="live-block ${isSel ? "rendering" : ""}" style="cursor:pointer" data-rev-seg="${it.segment_id}">
                   ${it.thumbnail_url ? `<img src="${esc(it.thumbnail_url)}" alt="" />` : ""}
                   <span class="tabular">#${it.segment_id}</span>
-                  <span class="mono" style="font-size:10px;color:var(--text-muted)">${Number(it.duration).toFixed(1)}s</span>
+                  <span class="mono" style="font-size:10px;color:var(--text-2)">${Number(it.duration).toFixed(1)}s</span>
                 </div>`;
               }).join("")}
             </div>
@@ -1573,12 +2363,12 @@
               <button class="btn btn-sm" id="rev-nudge-minus" ${selIdx === 0 ? "disabled" : ""}>-0.1s</button>
               <input class="time-input" type="number" step="0.1" id="rev-start-input" value="${Number(sel.start).toFixed(2)}" ${selIdx === 0 ? "disabled" : ""} />
               <button class="btn btn-sm" id="rev-nudge-plus" ${selIdx === 0 ? "disabled" : ""}>+0.1s</button>
-              <span class="mono" style="font-size:12px;color:var(--text-muted)">المدة: ${Number(sel.duration).toFixed(2)}s</span>
+              <span class="mono" style="font-size:12px;color:var(--text-2)">المدة: ${Number(sel.duration).toFixed(2)}s</span>
             </div>
           </div>
 
           <div class="field">
-            <div class="field-label">ملف المشهد الحالي: <span dir="ltr" style="unicode-bidi:isolate">${esc(sel.scene_filename || "غير محدد")}</span></div>
+            <div class="field-label">ملف المشهد الحالي: <span class="ltr-name">${esc(sel.scene_filename || "غير محدد")}</span></div>
             <label class="btn btn-sm" style="cursor:pointer">
               استبدال ملف المشهد
               <input type="file" id="rev-replace-file" accept=".png,.jpg,.jpeg,.webp,.mp4,.mov,.mkv,.webm" style="display:none" />
@@ -1665,22 +2455,30 @@
     document.getElementById("btn-review-rebuild").onclick = triggerExport;
   }
 
-  // ---------- Settings Modal ----------
+  // ---------- Settings Modal (Zero Whisper settings, includes 3 Themes) ----------
   function openSettingsModal() {
-    const s = state.project?.settings || {
+    const s = state.project?.settings || state.globalSettings?.defaults || {
       resolution: "1920x1080",
       fps: 30,
-      whisper_model: "medium",
-      language: "auto",
       background_fill: "blurred",
       slowmo_smooth: "off",
       default_motion_strength: 15,
+      theme: state.theme,
     };
+    const currTheme = normalizeTheme(s.theme || state.theme);
 
     openModal(`
       <div class="modal-header">
-        <h3 style="margin:0;font-size:18px">إعدادات المشروع</h3>
+        <h3 style="margin:0;font-size:18px">إعدادات المشروع والمظهر</h3>
         <button class="btn btn-sm btn-ghost" id="set-close">✕</button>
+      </div>
+      <div class="field">
+        <label class="field-label">المظهر العام (Themes)</label>
+        <select class="select" id="set-theme">
+          <option value="blue_night" ${currTheme === "blue_night" ? "selected" : ""}>ليل أزرق (الافتراضي)</option>
+          <option value="calm_forest" ${currTheme === "calm_forest" ? "selected" : ""}>غابة هادية</option>
+          <option value="daylight" ${currTheme === "daylight" ? "selected" : ""}>نهار (فاتح)</option>
+        </select>
       </div>
       <div class="field">
         <label class="field-label">الدقة (16:9)</label>
@@ -1699,20 +2497,8 @@
         </select>
       </div>
       <div class="field">
-        <label class="field-label">نموذج التفريغ الصوتي (Whisper CPU)</label>
-        <select class="select" id="set-whisper">
-          <option value="medium" ${s.whisper_model === "medium" ? "selected" : ""}>medium (الافتراضي — الأفضل للعربية)</option>
-          <option value="small" ${s.whisper_model === "small" ? "selected" : ""}>small (أسرع)</option>
-          <option value="large-v3" ${s.whisper_model === "large-v3" ? "selected" : ""}>large-v3 (أعلى دقة، أبطأ)</option>
-        </select>
-      </div>
-      <div class="field">
-        <label class="field-label">لغة الصوت</label>
-        <select class="select" id="set-lang">
-          <option value="auto" ${s.language === "auto" ? "selected" : ""}>تلقائي (عربي / إنجليزي)</option>
-          <option value="ar" ${s.language === "ar" ? "selected" : ""}>العربية (ar)</option>
-          <option value="en" ${s.language === "en" ? "selected" : ""}>الإنجليزية (en)</option>
-        </select>
+        <label class="field-label">قوة الحركة الافتراضية للصور (%)</label>
+        <input class="input tabular" type="number" min="5" max="40" id="set-motion-strength" value="${Number(s.default_motion_strength ?? 15)}" />
       </div>
       <div class="field">
         <label class="field-label">ملء الخلفية عند اختلاف الأبعاد</label>
@@ -1737,15 +2523,18 @@
 
     document.getElementById("set-close").onclick = closeModal;
     document.getElementById("set-cancel").onclick = closeModal;
+    document.getElementById("set-theme").onchange = (e) => applyTheme(e.target.value, false);
     document.getElementById("set-save").onclick = async () => {
+      const nextTheme = normalizeTheme(document.getElementById("set-theme").value);
       const nextSettings = {
+        theme: nextTheme,
         resolution: document.getElementById("set-res").value,
         fps: Number(document.getElementById("set-fps").value),
-        whisper_model: document.getElementById("set-whisper").value,
-        language: document.getElementById("set-lang").value,
+        default_motion_strength: Math.max(5, Math.min(40, Number(document.getElementById("set-motion-strength").value) || 15)),
         background_fill: document.getElementById("set-bg").value,
         slowmo_smooth: document.getElementById("set-slowmo").value,
       };
+      await applyTheme(nextTheme, true);
       if (state.project) {
         const res = await apiJson(`/api/projects/${state.project.id}`, "PATCH", { settings: nextSettings });
         state.project = res.project;
@@ -1757,7 +2546,7 @@
     };
   }
 
-  // ---------- Update 3: Problem Report, Startup Check & Updates Modal ----------
+  // ---------- Problem Report, Startup Check & Updates Modal ----------
   async function copyProblemReport() {
     try {
       const res = await api("/api/system/problem-report");
@@ -1783,7 +2572,12 @@
   async function checkUpdatesOnStartup() {
     try {
       const gs = await fetch("/api/settings/global").then((r) => r.json());
-      if (gs?.ok) state.globalSettings = gs;
+      if (gs?.ok) {
+        state.globalSettings = gs;
+        if (gs.defaults?.theme && !localStorage.getItem("autocut_theme_explicit")) {
+          applyTheme(gs.defaults.theme, false);
+        }
+      }
       const src = gs?.update_source || {};
       if (src.check_on_startup === false || !src.repo) return;
 
@@ -1796,7 +2590,7 @@
         }
       }
     } catch {
-      // Offline or rate-limited on startup -> silently ignore without blocking startup
+      // ignore offline
     }
   }
 
@@ -1820,7 +2614,7 @@
           window.location.reload();
         }
       } catch {
-        // Server is restarting; keep polling
+        // restarting
       }
     }, 900);
   }
@@ -1841,7 +2635,7 @@
       state.globalSettings = gs;
       state.backups = bk.backups || [];
     } catch {
-      // ignore transient errors
+      // ignore
     }
   }
 
@@ -1853,7 +2647,7 @@
 
   function renderUpdatesModal() {
     const tab = state.updateModalTab || "updates";
-    const curVer = state.health?.version || state.globalSettings?.version || "1.1.0";
+    const curVer = state.health?.version || state.globalSettings?.version || "1.2.0";
     const src = state.globalSettings?.update_source || {
       repo: "",
       branch: "main",
@@ -1864,7 +2658,6 @@
     };
 
     let tabBody = "";
-
     if (tab === "updates") {
       const plan = state.updatePlan;
       const job = state.updateJob;
@@ -1929,7 +2722,7 @@
             ${plan.commits?.length ? `
               <div style="margin-top:12px">
                 <div class="field-label" style="margin-bottom:4px">أحدث التعديلات (Commits):</div>
-                <ul class="update-list">${plan.commits.slice(0, 5).map((c) => `<li><span dir="ltr" style="unicode-bidi:isolate">${esc(c)}</span></li>`).join("")}</ul>
+                <ul class="update-list">${plan.commits.slice(0, 5).map((c) => `<li><span class="ltr-name">${esc(c)}</span></li>`).join("")}</ul>
               </div>
             ` : ""}
 
@@ -1995,7 +2788,7 @@
         <div class="field">
           <label class="field-label" for="src-repo">مستودع GitHub (owner/repo)</label>
           <input class="input mono" style="direction:ltr;text-align:left" id="src-repo" value="${esc(src.repo || "")}" placeholder="username/autocut" />
-          <div class="field-hint">مثال: <span class="mono">ahmed/autocut</span> (يعمل مع المستودعات العامة والخاصة).</div>
+          <div class="field-hint">مثال: <span class="mono">user/autocut</span> (يعمل مع المستودعات العامة والخاصة).</div>
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
           <div class="field">
@@ -2013,7 +2806,7 @@
             <input class="input mono" type="password" style="direction:ltr;text-align:left" id="src-token" value="" placeholder="${src.has_token ? `محفوظ (${src.token_masked}) — اتركه فارغاً للإبقاء عليه` : "اختياري للمستودع الخاص..."}" autocomplete="off" />
             ${src.has_token ? `<button class="btn btn-sm btn-danger" id="src-clear-token">مسح الرمز</button>` : ""}
           </div>
-          <div class="field-hint">يُحفظ محلياً في <span class="mono">settings.json</span> فقط ولا يظهر في الواجهة أو السجلات أو تقرير المشكلة.</div>
+          <div class="field-hint">يُحفظ محلياً في <span class="mono">settings.json</span> فقط ولا يظهر في الواجهة أو السجلات.</div>
         </div>
         <div class="field">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px">
@@ -2150,7 +2943,6 @@
                   renderUpdatesModal();
                 }
               } catch {
-                // Server may already be restarting cleanly
                 clearInterval(state.updatePollTimer);
                 state.updatePollTimer = null;
                 waitForServerRestartAndReload(document.getElementById("upd-job-msg"));
@@ -2181,7 +2973,7 @@
                 await apiJson("/api/updates/rollback", "POST", { backup_id: bid });
                 openModal(`
                   <div class="modal-header"><h3 style="margin:0">جاري التراجع...</h3></div>
-                  <p id="rb-wait-msg" style="color:var(--text-muted)">جاري استعادة النسخة الاحتياطية وإعادة تشغيل AutoCut...</p>
+                  <p id="rb-wait-msg" style="color:var(--text-2)">جاري استعادة النسخة الاحتياطية وإعادة تشغيل AutoCut...</p>
                 `);
                 waitForServerRestartAndReload(document.getElementById("rb-wait-msg"));
               } catch (err) {
@@ -2292,18 +3084,21 @@
 
   // ---------- Boot ----------
   document.addEventListener("DOMContentLoaded", async () => {
-    applyTheme(localStorage.getItem("autocut_theme") || "dark");
+    applyTheme(localStorage.getItem("autocut_theme") || "blue_night", false);
+
+    document.querySelectorAll("[data-theme-pick]").forEach((btn) => {
+      btn.onclick = () => {
+        localStorage.setItem("autocut_theme_explicit", "1");
+        applyTheme(btn.dataset.themePick, true);
+      };
+    });
 
     document.getElementById("btn-go-home").onclick = () => {
       state.project = null;
+      state.transcript = null;
       state.view = "home";
       updateChrome();
       loadProjects();
-    };
-
-    document.getElementById("btn-toggle-theme").onclick = () => {
-      const curr = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
-      applyTheme(curr === "light" ? "dark" : "light");
     };
 
     document.getElementById("btn-open-settings").onclick = openSettingsModal;

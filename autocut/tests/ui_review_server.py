@@ -1,4 +1,4 @@
-"""Local stdlib HTTP bridge for Playwright UI self-review & integration verification in sandboxed environments without FastAPI."""
+"""Local stdlib HTTP bridge for Playwright UI self-review across all 3 themes in v1.2.0."""
 
 from __future__ import annotations
 
@@ -7,8 +7,6 @@ import mimetypes
 import shutil
 import sys
 import tempfile
-import threading
-import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,9 +16,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from app.matching import match_segments_to_transcript, parse_numbered_segments, update_cut_start_time
-from app.motion import render_image_motion_clip
 from app.project import (
-    BASE_DIR,
     LOG_FILE,
     create_project,
     delete_project,
@@ -30,6 +26,7 @@ from app.project import (
     load_cuts,
     load_motions,
     load_project,
+    load_transcript,
     save_cuts,
     save_motions,
     save_project,
@@ -44,6 +41,12 @@ from app.settings_store import (
     save_global_settings,
 )
 from app.timeline import build_timeline
+from app.transcript_import import (
+    TranscriptImportError,
+    apply_ignored_segments,
+    parse_and_normalize_transcript,
+)
+from app.workspace_helpers import create_demo_project
 from tests.make_sample import make_sine_audio, make_solid_scene_image, make_testsrc_video
 
 WEB_DIR = ROOT_DIR / "web"
@@ -52,7 +55,7 @@ SIMULATED_UPDATE_SETTINGS = {"file": None}
 
 
 def seed_demo_project(projects_root: Path) -> str:
-    """Create a realistic Arabic project with audio, scenes, transcript, cuts, motions, and exported final.mp4."""
+    """Create a realistic Arabic project with imported transcript, suspicious line, estimated cut, scenes, motions, and final.mp4."""
     proj = create_project("وثائقي الحضارة الأندلسية", projects_root=projects_root)
     pid = proj["id"]
     pdir = get_project_dir(pid, projects_root)
@@ -62,7 +65,7 @@ def seed_demo_project(projects_root: Path) -> str:
     audio_path = make_sine_audio(pdir / "audio" / "التعليق_الصوتي.wav", duration_s=8.0)
     make_solid_scene_image(scenes_dir / "1.png", 1)
     make_solid_scene_image(scenes_dir / "2 - قرطبة.png", 2)
-    make_testsrc_video(scenes_dir / "scene_3.mp4", duration_s=0.6)  # 0.6s into 2.0s -> 0.30x extreme speed badge!
+    make_testsrc_video(scenes_dir / "scene_3.mp4", duration_s=0.6)
     make_solid_scene_image(scenes_dir / "4.png", 4)
     make_solid_scene_image(scenes_dir / "5.png", 5)
 
@@ -76,29 +79,21 @@ def seed_demo_project(projects_root: Path) -> str:
     parsed = parse_numbered_segments(raw_text)
     scan = scan_scenes_folder(pid, scenes_dir, segment_ids=[s["id"] for s in parsed["segments"]], projects_root=projects_root)
 
-    fake_transcript = {
-        "duration": 8.0,
-        "words": [
-            {"word": "في", "start": 0.0, "end": 0.3},
-            {"word": "قلب", "start": 0.3, "end": 0.7},
-            {"word": "الأندلس", "start": 0.7, "end": 1.3},
-            {"word": "كانت", "start": 1.6, "end": 2.0},
-            {"word": "قرطبة", "start": 2.0, "end": 2.5},
-            {"word": "مركزاً", "start": 2.5, "end": 3.0},
-            {"word": "وتدفقت", "start": 3.5, "end": 4.0},
-            {"word": "المياه", "start": 4.0, "end": 4.5},
-            {"word": "في", "start": 4.5, "end": 4.8},
-            {"word": "حدائق", "start": 4.8, "end": 5.3},
-            {"word": "وازدهرت", "start": 5.6, "end": 6.1},
-            {"word": "المكتبات", "start": 6.1, "end": 6.7},
-            {"word": "وبقي", "start": 7.0, "end": 7.4},
-            {"word": "أثر", "start": 7.4, "end": 7.7},
-            {"word": "الحقبة", "start": 7.7, "end": 8.0},
-        ],
-    }
-    save_transcript(pid, fake_transcript, projects_root=projects_root)
-    cuts = match_segments_to_transcript(parsed["segments"], fake_transcript, audio_duration=8.0)
-    # Force one low-confidence row for visual testing of low-confidence highlighting
+    # Use sentence-level SRT with 1 duplicate/Latin suspicious line so Screen 2 displays both badges + suspicious toggle!
+    srt_text = (
+        "1\n00:00:00,000 --> 00:00:01,500\nفي قلب الأندلس بدأت قصة حضارة مضيئة\n\n"
+        "2\n00:00:01,550 --> 00:00:03,400\nكانت قرطبة مركزاً للعلم والعمارة والفنون\n\n"
+        "3\n00:00:03,450 --> 00:00:05,300\nوتدفقت المياه في حدائق قصر الحمراء الرائعة\n\n"
+        "4\n00:00:05,350 --> 00:00:06,700\nوازدهرت المكتبات والمدارس في كل مدينة\n\n"
+        "5\n00:00:06,750 --> 00:00:07,600\nوبقي أثر تلك الحقبة خالداً حتى يومنا هذا\n\n"
+        "6\n00:00:07,650 --> 00:00:07,950\nThanks for watching subscribe now\n"
+    )
+    transcript = parse_and_normalize_transcript(srt_text, audio_duration=8.0, filename="andalus_vibe.srt")
+    save_transcript(pid, transcript, projects_root=projects_root)
+
+    cuts = match_segments_to_transcript(parsed["segments"], transcript, audio_duration=8.0)
+    cuts["segments"][2]["estimated"] = True
+    cuts["segments"][2]["badge"] = "تقدير"
     cuts["segments"][3]["confidence"] = 58.0
     save_cuts(pid, cuts, projects_root=projects_root)
 
@@ -127,6 +122,8 @@ def seed_demo_project(projects_root: Path) -> str:
             "audio_filename": audio_path.name,
             "audio_hash": file_sha256(audio_path),
             "audio_duration": 8.0,
+            "transcript_filename": transcript["filename"],
+            "transcript_precision": transcript["precision"],
             "scenes_dir": str(scenes_dir),
             "raw_text": raw_text,
             "scenes_scan": scan,
@@ -180,8 +177,8 @@ def make_handler(projects_root: Path):
                     "version": get_app_version(),
                     "ffmpeg_ok": not SIMULATED_MISSING_FFMPEG["flag"],
                     "ffprobe_ok": not SIMULATED_MISSING_FFMPEG["flag"],
-                    "faster_whisper_ok": True,
                     "rapidfuzz_ok": True,
+                    "transcription_mode": "external_import",
                     "log_path": str(LOG_FILE),
                     "last_update_result": None,
                 })
@@ -195,7 +192,7 @@ def make_handler(projects_root: Path):
             if path == "/api/system/problem-report":
                 sfile = SIMULATED_UPDATE_SETTINGS["file"]
                 rep = build_problem_report(
-                    {"ffmpeg_ok": True, "ffmpeg_version": "ffmpeg 4.4", "faster_whisper_ok": True, "rapidfuzz_ok": True},
+                    {"ffmpeg_ok": True, "ffmpeg_version": "ffmpeg 4.4", "rapidfuzz_ok": True},
                     settings_file=sfile,
                 )
                 self._send_json(200, {"ok": True, "report": rep})
@@ -206,7 +203,7 @@ def make_handler(projects_root: Path):
                     "ok": True,
                     "configured": True,
                     "local_version": get_app_version(),
-                    "remote_version": "1.2.0",
+                    "remote_version": "1.2.1",
                     "update_available": True,
                     "commit_date": "2026-11-22T12:00:00Z",
                     "subfolder": "autocut",
@@ -218,11 +215,11 @@ def make_handler(projects_root: Path):
                     "ok": True,
                     "backups": [
                         {
-                            "id": "1.0.0_20261122_100000",
-                            "old_version": "1.0.0",
-                            "target_version": "1.1.0",
+                            "id": "1.1.0_20261122_100000",
+                            "old_version": "1.1.0",
+                            "target_version": "1.2.0",
                             "created_at": "2026-11-22T10:00:00Z",
-                            "file_count": 4,
+                            "file_count": 6,
                         }
                     ],
                 })
@@ -239,10 +236,20 @@ def make_handler(projects_root: Path):
                     meta = load_project(pid, projects_root)
                     cuts = load_cuts(pid, projects_root)
                     motions = load_motions(pid, projects_root)
+                    transcript = load_transcript(pid, projects_root)
                     scenes_map = (meta.get("scenes_scan") or {}).get("scenes") or {}
                     tl = build_timeline(cuts, scenes_map, fps=int(meta["settings"]["fps"]), overrides=meta.get("overrides") or {}) if cuts else None
                     has_out = (get_project_dir(pid, projects_root) / "output" / "final.mp4").exists()
-                    self._send_json(200, {"ok": True, "project": meta, "cuts": cuts, "timeline": tl, "motions": motions, "has_output": has_out})
+                    self._send_json(200, {
+                        "ok": True,
+                        "project": meta,
+                        "cuts": cuts,
+                        "timeline": tl,
+                        "motions": motions,
+                        "transcript": transcript,
+                        "has_transcript": transcript is not None,
+                        "has_output": has_out,
+                    })
                     return
                 if parts[1] == "audio":
                     meta = load_project(pid, projects_root)
@@ -266,7 +273,6 @@ def make_handler(projects_root: Path):
                     self._send_file(get_project_dir(pid, projects_root) / "previews" / Path(parts[2]).name, "video/mp4")
                     return
 
-            # Static files from autocut/web
             rel = "index.html" if path == "/" else path.lstrip("/")
             fpath = WEB_DIR / rel
             if fpath.exists() and fpath.is_file():
@@ -290,7 +296,7 @@ def make_handler(projects_root: Path):
                     "repo": body.get("repo") or "demo/autocut",
                     "branch": body.get("branch") or "main",
                     "subfolder": "autocut",
-                    "remote_version": "1.2.0",
+                    "remote_version": "1.2.1",
                     "commit_date": "2026-11-22T12:00:00Z",
                 })
                 return
@@ -300,31 +306,28 @@ def make_handler(projects_root: Path):
                     "ok": True,
                     "source": "github",
                     "local_version": get_app_version(),
-                    "remote_version": "1.2.0",
+                    "remote_version": "1.2.1",
                     "update_available": True,
                     "commit_date": "2026-11-22T12:00:00Z",
                     "subfolder": "autocut",
-                    "changelog": [
-                        "1.2.0 (2026-11-22)",
-                        "تحسين سرعة مطابقة الكلمات العربية مع تقليل وقت المعالجة بنسبة 25%.",
-                        "إضافة مؤشر مرئي لحالة التصدير الجزئي.",
-                    ],
-                    "commits": ["feat: faster Arabic fuzzy cut alignment", "fix: smooth easing clamp"],
-                    "to_download": [
-                        {"relpath": "VERSION", "sha": "abc", "size": 6},
-                        {"relpath": "app/matching.py", "sha": "def", "size": 14820},
-                        {"relpath": "web/app.js", "sha": "ghi", "size": 84120},
-                    ],
+                    "changelog": ["1.2.1", "تحسينات واجهة الاستيراد."],
+                    "commits": ["feat: v1.2 external transcript polish"],
+                    "to_download": [{"relpath": "VERSION", "sha": "abc", "size": 6}],
                     "to_delete": [],
-                    "unchanged_count": 22,
-                    "change_count": 3,
-                    "total_bytes": 98946,
-                    "total_mb": 0.094,
+                    "unchanged_count": 24,
+                    "change_count": 1,
+                    "total_bytes": 6,
+                    "total_mb": 0.001,
                 })
                 return
 
             if path == "/api/updates/ack-result":
                 self._send_json(200, {"ok": True})
+                return
+
+            if path == "/api/projects/demo":
+                meta = create_demo_project(projects_root=projects_root)
+                self._send_json(200, {"ok": True, "project": meta})
                 return
 
             if path == "/api/projects":
@@ -338,6 +341,52 @@ def make_handler(projects_root: Path):
                 if len(parts) >= 2 and parts[1] == "parse-text":
                     res = parse_numbered_segments(body.get("raw_text", ""))
                     self._send_json(200, {"ok": True, **res})
+                    return
+                if len(parts) >= 2 and parts[1] == "import-transcript":
+                    meta = load_project(pid, projects_root)
+                    try:
+                        tr = parse_and_normalize_transcript(
+                            str(body.get("text") or ""),
+                            audio_duration=float(meta.get("audio_duration") or 0.0),
+                            filename=str(body.get("filename") or "pasted.txt"),
+                        )
+                    except TranscriptImportError as exc:
+                        self._send_json(400, {
+                            "ok": False,
+                            "error": exc.message,
+                            "hint": exc.hint,
+                            "code": exc.code,
+                            "preview_lines": exc.preview_lines,
+                        })
+                        return
+                    save_transcript(pid, tr, projects_root=projects_root)
+                    meta = save_project(
+                        pid,
+                        {"transcript_filename": tr["filename"], "transcript_precision": tr["precision"]},
+                        projects_root=projects_root,
+                    )
+                    self._send_json(200, {"ok": True, "transcript": tr, "project": meta})
+                    return
+                if len(parts) >= 3 and parts[1] == "transcript" and parts[2] == "ignored":
+                    meta = load_project(pid, projects_root)
+                    tr = apply_ignored_segments(load_transcript(pid, projects_root), body.get("ignored_indices") or [])
+                    save_transcript(pid, tr, projects_root=projects_root)
+                    cuts = match_segments_to_transcript(parse_numbered_segments(meta.get("raw_text") or "")["segments"], tr, audio_duration=float(meta.get("audio_duration") or 8.0))
+                    save_cuts(pid, cuts, projects_root=projects_root)
+                    tl = build_timeline(cuts, (meta.get("scenes_scan") or {}).get("scenes") or {}, fps=int(meta["settings"]["fps"]))
+                    self._send_json(200, {"ok": True, "transcript": tr, "cuts": cuts, "timeline": tl})
+                    return
+                if len(parts) >= 2 and parts[1] == "match-cuts":
+                    meta = load_project(pid, projects_root)
+                    tr = load_transcript(pid, projects_root)
+                    raw_text = body.get("raw_text") if body.get("raw_text") is not None else meta.get("raw_text", "")
+                    parsed = parse_numbered_segments(raw_text)
+                    cuts = match_segments_to_transcript(parsed["segments"], tr, audio_duration=float(meta.get("audio_duration") or 8.0))
+                    save_cuts(pid, cuts, projects_root=projects_root)
+                    tl = build_timeline(cuts, (meta.get("scenes_scan") or {}).get("scenes") or {}, fps=int(meta["settings"]["fps"]))
+                    nxt = "motion" if body.get("auto_mode") else "cuts"
+                    meta = save_project(pid, {"raw_text": raw_text, "stage": nxt}, projects_root=projects_root)
+                    self._send_json(200, {"ok": True, "project": meta, "cuts": cuts, "timeline": tl, "scenes_scan": meta.get("scenes_scan")})
                     return
                 if len(parts) >= 4 and parts[1] == "cuts" and parts[3] == "start":
                     seg_id = int(parts[2])

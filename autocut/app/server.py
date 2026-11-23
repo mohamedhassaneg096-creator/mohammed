@@ -6,19 +6,19 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .matching import match_segments_to_transcript, parse_numbered_segments, update_cut_start_time
 from .motion import render_image_motion_clip
-import sys
-import time
 from .project import (
     BASE_DIR,
     LOG_FILE,
@@ -37,6 +37,7 @@ from .project import (
     save_cuts,
     save_motions,
     save_project,
+    save_transcript,
 )
 from .render import export_timeline_video
 from .scenes import SUPPORTED_EXTS, scan_scenes_folder
@@ -49,7 +50,12 @@ from .settings_store import (
     save_global_settings,
 )
 from .timeline import TimelineInvariantError, build_timeline
-from .transcribe import probe_media_duration, transcribe_audio
+from .transcribe import probe_media_duration
+from .transcript_import import (
+    TranscriptImportError,
+    apply_ignored_segments,
+    parse_and_normalize_transcript,
+)
 from .updater import (
     UpdaterError,
     check_github_version_only,
@@ -59,6 +65,7 @@ from .updater import (
     test_github_connection,
 )
 from .updater_helper import list_backups
+from .workspace_helpers import apply_quick_folder, create_demo_project, find_companion_files
 
 WEB_DIR = BASE_DIR / "web"
 
@@ -88,12 +95,6 @@ def check_binaries() -> Dict[str, Any]:
         pass
 
     try:
-        import faster_whisper  # noqa: F401
-        whisper_ok = True
-    except ImportError:
-        whisper_ok = False
-
-    try:
         import rapidfuzz  # noqa: F401
         rapidfuzz_ok = True
     except ImportError:
@@ -105,8 +106,8 @@ def check_binaries() -> Dict[str, Any]:
         "ffmpeg_ok": ffmpeg_ok,
         "ffprobe_ok": ffprobe_ok,
         "ffmpeg_version": ffmpeg_ver,
-        "faster_whisper_ok": whisper_ok,
         "rapidfuzz_ok": rapidfuzz_ok,
+        "transcription_mode": "external_import",
         "log_path": str(LOG_FILE),
     }
 
@@ -151,6 +152,12 @@ async def api_create_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "project": meta}
 
 
+@app.post("/api/projects/demo")
+def api_create_demo_project() -> Dict[str, Any]:
+    meta = create_demo_project()
+    return {"ok": True, "project": meta}
+
+
 @app.get("/api/projects/{project_id}")
 def api_get_project(project_id: str) -> Dict[str, Any]:
     try:
@@ -181,6 +188,7 @@ def api_get_project(project_id: str) -> Dict[str, Any]:
         "cuts": cuts,
         "timeline": timeline,
         "motions": motions,
+        "transcript": transcript,
         "has_transcript": transcript is not None,
         "has_output": has_output,
     }
@@ -213,7 +221,6 @@ async def api_upload_audio(project_id: str, file: UploadFile = File(...)) -> Dic
     pdir = get_project_dir(project_id)
     audio_dir = pdir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
-    # Clean previous audio files in project/audio
     for old in audio_dir.iterdir():
         if old.is_file():
             old.unlink()
@@ -243,7 +250,42 @@ async def api_upload_audio(project_id: str, file: UploadFile = File(...)) -> Dic
         "audio_hash": ahash,
         "audio_duration": round(duration, 3),
     })
-    return {"ok": True, "project": meta}
+    return {"ok": True, "project": meta, "companions": find_companion_files(dest)}
+
+
+@app.post("/api/projects/{project_id}/audio-from-path")
+async def api_audio_from_path(project_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        load_project(project_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="المشروع غير موجود.")
+
+    src = Path(str(payload.get("path") or "").strip())
+    if not src.exists() or not src.is_file():
+        return JSONResponse(status_code=400, content={"ok": False, "error": "ملف الصوت غير موجود في المسار المحدد."})
+
+    pdir = get_project_dir(project_id)
+    audio_dir = pdir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    for old in audio_dir.iterdir():
+        if old.is_file():
+            old.unlink()
+
+    dest = audio_dir / src.name
+    shutil.copy2(src, dest)
+    try:
+        duration = probe_media_duration(dest)
+    except Exception as exc:
+        logger.exception("Audio ffprobe failed: %s", exc)
+        return JSONResponse(status_code=400, content={"ok": False, "error": "تعذر قراءة ملف الصوت عبر FFmpeg."})
+
+    meta = save_project(project_id, {
+        "audio_path": str(dest.resolve()),
+        "audio_filename": src.name,
+        "audio_hash": file_sha256(dest),
+        "audio_duration": round(duration, 3),
+    })
+    return {"ok": True, "project": meta, "companions": find_companion_files(src)}
 
 
 @app.get("/api/projects/{project_id}/audio")
@@ -255,12 +297,233 @@ def api_stream_audio(project_id: str):
     return FileResponse(ap, filename=meta.get("audio_filename") or "audio")
 
 
+@app.post("/api/projects/{project_id}/import-transcript")
+async def api_import_transcript(
+    project_id: str,
+    request: Request,
+    file: Optional[UploadFile] = File(default=None),
+) -> Dict[str, Any]:
+    """Import external transcript (JSON/SRT/VTT) via file upload, pasted text, or local_path."""
+    try:
+        meta = load_project(project_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="المشروع غير موجود.")
+
+    audio_dur = float(meta.get("audio_duration") or 0.0)
+    raw_data: str | bytes = ""
+    fname = "transcript.txt"
+
+    if file is not None:
+        fname = Path(file.filename or "transcript.txt").name
+        raw_data = await file.read()
+    else:
+        ct = (request.headers.get("content-type") or "").lower()
+        if "application/json" in ct:
+            body = await request.json()
+        else:
+            body = {}
+        local_path = str(body.get("local_path") or "").strip()
+        if local_path:
+            lp = Path(local_path)
+            if not lp.exists() or not lp.is_file():
+                return JSONResponse(status_code=400, content={"ok": False, "error": "ملف التفريغ المحدد غير موجود."})
+            fname = lp.name
+            raw_data = lp.read_bytes()
+        else:
+            fname = Path(str(body.get("filename") or "pasted_transcript.txt")).name
+            raw_data = str(body.get("text") or "")
+
+    try:
+        transcript = parse_and_normalize_transcript(raw_data, audio_duration=audio_dur, filename=fname)
+    except TranscriptImportError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": exc.message,
+                "hint": exc.hint,
+                "code": exc.code,
+                "preview_lines": exc.preview_lines,
+            },
+        )
+
+    save_transcript(project_id, transcript)
+    meta = save_project(
+        project_id,
+        {
+            "transcript_filename": transcript["filename"],
+            "transcript_precision": transcript["precision"],
+        },
+    )
+    return {"ok": True, "transcript": transcript, "project": meta}
+
+
+@app.post("/api/projects/{project_id}/transcript/ignored")
+async def api_update_ignored_transcript_lines(project_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Toggle ignored lines inside imported transcript without deleting them; refreshes cuts if already matched."""
+    try:
+        meta = load_project(project_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="المشروع غير موجود.")
+
+    transcript = load_transcript(project_id)
+    if not transcript:
+        raise HTTPException(status_code=404, detail="لا يوجد ملف تفريغ مستورد لهذا المشروع.")
+
+    ignored_indices = payload.get("ignored_indices") or []
+    transcript = apply_ignored_segments(transcript, ignored_indices)
+    save_transcript(project_id, transcript)
+
+    cuts = load_cuts(project_id)
+    timeline = None
+    if cuts and meta.get("raw_text"):
+        parsed = parse_numbered_segments(meta["raw_text"])
+        if parsed["segments"]:
+            cuts = match_segments_to_transcript(
+                parsed["segments"],
+                transcript,
+                audio_duration=float(meta.get("audio_duration") or transcript.get("duration") or 0.0),
+            )
+            save_cuts(project_id, cuts)
+            scenes_map = (meta.get("scenes_scan") or {}).get("scenes") or {}
+            if scenes_map:
+                timeline = build_timeline(
+                    cuts,
+                    scenes_map,
+                    fps=int(meta["settings"].get("fps", 30)),
+                    overrides=meta.get("overrides") or {},
+                )
+
+    return {"ok": True, "transcript": transcript, "cuts": cuts, "timeline": timeline}
+
+
 @app.post("/api/projects/{project_id}/parse-text")
 async def api_parse_text(project_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     raw_text = str(payload.get("raw_text") or "")
     save_project(project_id, {"raw_text": raw_text})
     parsed = parse_numbered_segments(raw_text)
     return {"ok": True, **parsed}
+
+
+@app.post("/api/projects/{project_id}/import-script-file")
+async def api_import_script_file(
+    project_id: str,
+    request: Request,
+    file: Optional[UploadFile] = File(default=None),
+) -> Dict[str, Any]:
+    """Load numbered script from a .txt file upload or local_path."""
+    try:
+        load_project(project_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="المشروع غير موجود.")
+
+    if file is not None:
+        raw_bytes = await file.read()
+    else:
+        body = await request.json()
+        lp = Path(str(body.get("local_path") or "").strip())
+        if not lp.exists() or not lp.is_file():
+            return JSONResponse(status_code=400, content={"ok": False, "error": "ملف النص المحدد غير موجود."})
+        raw_bytes = lp.read_bytes()
+
+    if b"\x00" in raw_bytes:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "الملف المحدد ليس ملفاً نصياً (.txt)."})
+    try:
+        raw_text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "تعذر قراءة الملف بترميز UTF-8."})
+
+    meta = save_project(project_id, {"raw_text": raw_text})
+    parsed = parse_numbered_segments(raw_text)
+    return {"ok": True, "project": meta, **parsed}
+
+
+@app.post("/api/projects/{project_id}/match-cuts")
+async def api_match_cuts(project_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build contiguous cut points by matching numbered script against the imported transcript."""
+    payload = payload or {}
+    meta = load_project(project_id)
+
+    transcript = load_transcript(project_id)
+    if not transcript:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "يرجى استيراد ملف التفريغ (JSON أو SRT أو VTT) أولاً."},
+        )
+
+    raw_text = payload.get("raw_text") if payload.get("raw_text") is not None else meta.get("raw_text", "")
+    parsed = parse_numbered_segments(raw_text)
+    if not parsed["segments"]:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "يرجى إدخال النص المرقم (1..N) أولاً."})
+
+    scenes_dir = str(payload.get("scenes_dir") if payload.get("scenes_dir") is not None else meta.get("scenes_dir") or "").strip()
+    auto_mode = bool(payload.get("auto_mode", False))
+
+    cuts = match_segments_to_transcript(
+        segments=parsed["segments"],
+        transcript=transcript,
+        audio_duration=float(meta.get("audio_duration") or transcript.get("duration") or 0.0),
+    )
+    save_cuts(project_id, cuts)
+
+    seg_ids = [s["id"] for s in parsed["segments"]]
+    scan = meta.get("scenes_scan")
+    if scenes_dir:
+        scan = scan_scenes_folder(project_id, scenes_dir, segment_ids=seg_ids, generate_thumbs=True)
+        meta = save_project(project_id, {"raw_text": raw_text, "scenes_dir": scenes_dir, "scenes_scan": scan})
+    else:
+        meta = save_project(project_id, {"raw_text": raw_text})
+
+    timeline = None
+    if scan and scan.get("scenes"):
+        timeline = build_timeline(
+            cuts,
+            scan["scenes"],
+            fps=int(meta["settings"].get("fps", 30)),
+            overrides=meta.get("overrides") or {},
+        )
+
+    next_stage = "motion" if auto_mode else "cuts"
+    meta = save_project(project_id, {"stage": next_stage})
+    return {
+        "ok": True,
+        "project": meta,
+        "cuts": cuts,
+        "timeline": timeline,
+        "scenes_scan": scan,
+    }
+
+
+@app.post("/api/projects/{project_id}/quick-folder")
+async def api_quick_folder(
+    project_id: str,
+    request: Request,
+    files: Optional[List[UploadFile]] = File(default=None),
+) -> Dict[str, Any]:
+    """Quick project import from one folder (local folder path OR browser webkitdirectory file upload)."""
+    try:
+        load_project(project_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="المشروع غير موجود.")
+
+    if files:
+        uploaded: List[tuple[str, bytes]] = []
+        for uf in files:
+            rel = str(uf.filename or "").strip()
+            if not rel:
+                continue
+            uploaded.append((rel, await uf.read()))
+        res = apply_quick_folder(project_id, uploaded_files=uploaded)
+    else:
+        body = await request.json()
+        fpath = str(body.get("folder_path") or "").strip()
+        if not fpath:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "يرجى تحديد المجلد أولاً."})
+        res = apply_quick_folder(project_id, folder_path=Path(fpath))
+
+    if not res.get("ok"):
+        return JSONResponse(status_code=400, content=res)
+    return res
 
 
 @app.post("/api/projects/{project_id}/scan-scenes")
@@ -353,117 +616,6 @@ async def api_replace_scene(project_id: str, seg_id: int, file: UploadFile = Fil
     return {"ok": True, "project": meta, "timeline": timeline}
 
 
-@app.post("/api/projects/{project_id}/transcribe-and-match")
-async def api_start_transcribe_match(project_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    payload = payload or {}
-    meta = load_project(project_id)
-    audio_path = meta.get("audio_path")
-    if not audio_path or not Path(audio_path).exists():
-        return JSONResponse(status_code=400, content={"ok": False, "error": "يرجى اختيار ملف الصوت أولاً."})
-
-    raw_text = payload.get("raw_text") if payload.get("raw_text") is not None else meta.get("raw_text", "")
-    parsed = parse_numbered_segments(raw_text)
-    if not parsed["segments"]:
-        return JSONResponse(status_code=400, content={"ok": False, "error": "يرجى لصق النص المرقم (1..N) أولاً."})
-
-    scenes_dir = payload.get("scenes_dir") if payload.get("scenes_dir") is not None else meta.get("scenes_dir", "")
-    save_project(project_id, {"raw_text": raw_text, "scenes_dir": scenes_dir})
-
-    job_id = uuid.uuid4().hex[:10]
-    cancel_ev = threading.Event()
-    with _JOBS_LOCK:
-        _JOB_EVENTS[job_id] = cancel_ev
-        _JOBS[job_id] = {
-            "id": job_id,
-            "type": "transcribe_match",
-            "status": "running",
-            "progress": 0.0,
-            "elapsed": 0.0,
-            "eta": None,
-            "message": "جاري بدء التفريغ الصوتي...",
-            "words_preview": "",
-            "cuts": None,
-            "timeline": None,
-            "scenes_scan": None,
-            "error": None,
-        }
-
-    force_retranscribe = bool(payload.get("force", False))
-    auto_mode = bool(payload.get("auto_mode", False))
-
-    def _run() -> None:
-        try:
-            settings = meta["settings"]
-            def _on_prog(pct: float, elapsed: float, eta: Optional[float], words_preview: str) -> None:
-                _update_job(
-                    job_id,
-                    progress=round(pct * 0.75, 1),
-                    elapsed=elapsed,
-                    eta=eta,
-                    words_preview=words_preview,
-                    message="جاري تفريغ الصوت واستخراج توقيت الكلمات...",
-                )
-
-            transcript = transcribe_audio(
-                project_id=project_id,
-                audio_path=Path(audio_path),
-                model_name=settings.get("whisper_model", "medium"),
-                language=settings.get("language", "auto"),
-                force=force_retranscribe,
-                progress_callback=_on_prog,
-                cancel_event=cancel_ev,
-            )
-
-            _update_job(job_id, progress=82.0, message="جاري مطابقة المقاطع المرقمة وحساب نقاط القص...")
-            cuts = match_segments_to_transcript(
-                segments=parsed["segments"],
-                transcript=transcript,
-                audio_duration=float(meta.get("audio_duration") or transcript.get("duration") or 0.0),
-            )
-            save_cuts(project_id, cuts)
-
-            _update_job(job_id, progress=90.0, cuts=cuts, message="جاري فحص المشاهد وتركيبها على الخط الزمني...")
-            seg_ids = [s["id"] for s in parsed["segments"]]
-            scan = meta.get("scenes_scan")
-            if scenes_dir:
-                scan = scan_scenes_folder(project_id, scenes_dir, segment_ids=seg_ids, generate_thumbs=True)
-                save_project(project_id, {"scenes_scan": scan})
-
-            timeline = None
-            if scan and scan.get("scenes"):
-                timeline = build_timeline(
-                    cuts,
-                    scan["scenes"],
-                    fps=int(settings.get("fps", 30)),
-                    overrides=meta.get("overrides") or {},
-                )
-
-            next_stage = "motion" if auto_mode else "cuts"
-            save_project(project_id, {"stage": next_stage})
-            _update_job(
-                job_id,
-                status="done",
-                progress=100.0,
-                cuts=cuts,
-                scenes_scan=scan,
-                timeline=timeline,
-                message="اكتمل التفريغ والقص ومطابقة المشاهد!",
-            )
-        except InterruptedError as exc:
-            _update_job(job_id, status="cancelled", error=str(exc), message="تم إلغاء العملية.")
-        except Exception as exc:
-            logger.exception("Transcribe/match job failed: %s", exc)
-            _update_job(
-                job_id,
-                status="error",
-                error=str(exc) if "faster-whisper" in str(exc) else "تعذر إتمام التفريغ الصوتي. راجع ملف السجل.",
-                message="حدث خطأ أثناء التفريغ.",
-            )
-
-    threading.Thread(target=_run, daemon=True).start()
-    return {"ok": True, "job_id": job_id}
-
-
 @app.get("/api/jobs/{job_id}")
 def api_job_status(job_id: str) -> Dict[str, Any]:
     with _JOBS_LOCK:
@@ -531,7 +683,7 @@ async def api_save_motions(project_id: str, payload: Dict[str, Any]) -> Dict[str
         "assignments": payload.get("assignments") or {},
     }
     save_motions(project_id, motions)
-    save_project(project_id, {})  # Update updated_at timestamp
+    save_project(project_id, {})
     return {"ok": True, "motions": motions}
 
 
@@ -552,14 +704,13 @@ async def api_preview_motion(project_id: str, payload: Dict[str, Any]) -> Dict[s
     pdir = get_project_dir(project_id)
     preview_name = f"preview_{seg_id}_{uuid.uuid4().hex[:6]}.mp4"
     out_mp4 = pdir / "previews" / preview_name
-    # Remove old previews for this segment
     for old in (pdir / "previews").glob(f"preview_{seg_id}_*.mp4"):
         old.unlink(missing_ok=True)
 
     render_image_motion_clip(
         src_image=Path(scene["path"]),
         out_clip=out_mp4,
-        frame_count=60,  # 2.5s at 24fps -> ultra-fast 480p preview
+        frame_count=60,
         width=854,
         height=480,
         fps=24,
@@ -683,7 +834,7 @@ def api_get_scene_file(project_id: str, seg_id: int):
 
 @app.post("/api/system/pick-folder")
 def api_pick_folder() -> Dict[str, Any]:
-    """Open native Windows folder picker dialog (PowerShell / tkinter) on localhost."""
+    """Open native Windows folder picker dialog (PowerShell) on localhost."""
     if platform.system() == "Windows":
         ps_script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
@@ -729,7 +880,7 @@ def api_problem_report() -> Dict[str, Any]:
     return {"ok": True, "report": build_problem_report(check_binaries())}
 
 
-# ---------- Update 3: Global Settings, GitHub Delta Patch Updater, Local Fallback & Rollback ----------
+# ---------- Global Settings, GitHub Delta Patch Updater, Local Fallback & Rollback ----------
 
 def _trigger_swap_and_restart(pending_payload: Dict[str, Any]) -> None:
     """Write pending swap marker and exit engine cleanly so helper/supervisor swaps unlocked files and restarts."""
@@ -868,7 +1019,7 @@ def api_updates_apply() -> Dict[str, Any]:
 
 @app.post("/api/updates/local-zip")
 async def api_updates_local_zip(file: UploadFile = File(...)) -> Dict[str, Any]:
-    """Offline fallback (Update 2): stage and apply update from an uploaded .zip release."""
+    """Offline fallback: stage and apply update from an uploaded .zip release."""
     tmp_zip = BASE_DIR / "staging" / f"upload_{uuid.uuid4().hex[:6]}.zip"
     tmp_zip.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -885,7 +1036,7 @@ async def api_updates_local_zip(file: UploadFile = File(...)) -> Dict[str, Any]:
 
 @app.post("/api/updates/local-folder")
 async def api_updates_local_folder(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Offline fallback (Update 2): stage and apply update from a local folder path."""
+    """Offline fallback: stage and apply update from a local folder path."""
     folder = str(payload.get("path") or "").strip()
     try:
         res = stage_local_update(Path(folder))
@@ -922,4 +1073,3 @@ def api_updates_ack_result() -> Dict[str, Any]:
 
 # Serve static frontend from autocut/web/
 app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
-

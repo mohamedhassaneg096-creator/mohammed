@@ -199,7 +199,13 @@ def match_segments_to_transcript(
     1) Compute all cut points first in strictly non-decreasing order.
     2) Assign segment numbers 1..N after cuts are computed.
     """
-    words: List[Dict[str, Any]] = transcript.get("words") or []
+    raw_words: List[Dict[str, Any]] = transcript.get("words") or []
+    words: List[Dict[str, Any]] = [w for w in raw_words if not w.get("ignored")]
+
+    def _w_text(w: Dict[str, Any]) -> str:
+        val = w.get("text") if w.get("text") is not None else w.get("word")
+        return str(val or "")
+
     if audio_duration is None or audio_duration <= 0:
         if words:
             audio_duration = float(words[-1].get("end") or words[-1].get("start") or 0.0)
@@ -209,7 +215,7 @@ def match_segments_to_transcript(
     if not segments:
         return {"audio_duration": audio_duration, "segments": []}
 
-    norm_t_words = [normalize_text(str(w.get("word", ""))) for w in words]
+    norm_t_words = [normalize_text(_w_text(w)) for w in words]
     # Filter empty normalized tokens while keeping original index mapping
     indexed_tokens: List[Tuple[int, str]] = [
         (i, tok) for i, tok in enumerate(norm_t_words) if tok
@@ -224,21 +230,24 @@ def match_segments_to_transcript(
         q_words = normalize_words(seg.get("text", ""))[:opening_word_count]
 
         if seg_pos == 0:
-            # Segment 1 always starts at 0.0 (Section 3)
+            # Segment 1 always starts at 0.0
             matched_text = ""
             conf = 100.0 if n_tok > 0 else 0.0
             matched = True
+            is_est = False
             if n_tok > 0 and q_words:
                 idx, wlen, score = _best_window_match(q_words, tok_list, 0, min(n_tok, 25))
                 if idx is not None and score >= min_match_threshold:
                     orig_start = indexed_tokens[idx][0]
                     orig_end = indexed_tokens[min(n_tok - 1, idx + wlen - 1)][0]
-                    matched_text = " ".join(str(words[i].get("word", "")).strip() for i in range(orig_start, orig_end + 1))
+                    matched_text = " ".join(_w_text(words[i]).strip() for i in range(orig_start, orig_end + 1))
                     conf = score
                     cursor_tok = idx + 1
+                    w0 = words[orig_start]
+                    is_est = bool(w0.get("estimated") and int(w0.get("word_index_in_segment", 0)) > 0)
                 else:
                     orig_end = min(len(words) - 1, max(0, len(q_words) - 1))
-                    matched_text = " ".join(str(words[i].get("word", "")).strip() for i in range(0, orig_end + 1))
+                    matched_text = " ".join(_w_text(words[i]).strip() for i in range(0, orig_end + 1))
                     conf = score if idx is not None else 60.0
                     cursor_tok = 1
             raw_cuts.append({
@@ -246,6 +255,7 @@ def match_segments_to_transcript(
                 "matched_text": matched_text,
                 "confidence": round(conf, 1),
                 "matched": matched,
+                "estimated": is_est,
                 "token_index": 0,
             })
             continue
@@ -258,6 +268,7 @@ def match_segments_to_transcript(
                 "matched_text": "",
                 "confidence": 0.0,
                 "matched": False,
+                "estimated": False,
                 "token_index": cursor_tok,
             })
             continue
@@ -275,7 +286,8 @@ def match_segments_to_transcript(
         if best_idx is not None and best_score >= min_match_threshold:
             orig_start_idx = indexed_tokens[best_idx][0]
             orig_end_idx = indexed_tokens[min(n_tok - 1, best_idx + best_len - 1)][0]
-            start_time = float(words[orig_start_idx]["start"])
+            w_start_obj = words[orig_start_idx]
+            start_time = float(w_start_obj["start"])
 
             # Guarantee strict monotonic non-decreasing time
             prev_start = raw_cuts[-1]["start"]
@@ -283,15 +295,18 @@ def match_segments_to_transcript(
                 start_time = min(audio_duration, prev_start + 0.05)
 
             matched_text = " ".join(
-                str(words[i].get("word", "")).strip()
+                _w_text(words[i]).strip()
                 for i in range(orig_start_idx, orig_end_idx + 1)
             )
+            # Flag mid-line estimated start when transcript is sentence-level and word is inside a cue
+            is_est = bool(w_start_obj.get("estimated") and int(w_start_obj.get("word_index_in_segment", 0)) > 0)
             cursor_tok = best_idx + 1  # Strictly advance after matched start
             raw_cuts.append({
                 "start": round(start_time, 3),
                 "matched_text": matched_text,
                 "confidence": round(best_score, 1),
                 "matched": True,
+                "estimated": is_est,
                 "token_index": best_idx,
             })
         else:
@@ -306,6 +321,7 @@ def match_segments_to_transcript(
                 "matched_text": "",
                 "confidence": round(max(0.0, best_score), 1),
                 "matched": False,
+                "estimated": False,
                 "token_index": cursor_tok,
             })
 
@@ -329,6 +345,7 @@ def match_segments_to_transcript(
         end_time = round(max(cut["start"] + 0.04, end_time), 3)
         start_time = round(cut["start"], 3)
         seg = segments[idx]
+        is_est = bool(cut.get("estimated", False))
         numbered_segments.append({
             "id": int(seg["id"]),
             "text": seg["text"],
@@ -338,6 +355,8 @@ def match_segments_to_transcript(
             "duration": round(end_time - start_time, 3),
             "confidence": cut["confidence"],
             "matched": cut["matched"],
+            "estimated": is_est,
+            "badge": "تقدير" if is_est else "",
             "edited": False,
         })
 

@@ -30,111 +30,91 @@ console.log('Bridge:', ready);
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage({ viewport: { width: 1366, height: 820 } });
 
-try {
-  // 1. Home (populated)
-  await page.goto('http://127.0.0.1:8765/', { waitUntil: 'networkidle' });
-  await page.waitForTimeout(300);
-  await page.screenshot({ path: path.join(shotsDir, '01_home_projects.png') });
-
-  // 2. Error banner state (FFmpeg missing)
-  await page.evaluate(async () => {
-    await fetch('/api/test/toggle-ffmpeg-error', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ missing: true }),
-    });
-  });
-  await page.reload({ waitUntil: 'networkidle' });
-  await page.waitForTimeout(250);
-  await page.screenshot({ path: path.join(shotsDir, '02_error_state_ffmpeg.png') });
-
-  // Restore FFmpeg OK
-  await page.evaluate(async () => {
-    await fetch('/api/test/toggle-ffmpeg-error', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ missing: false }),
-    });
-  });
-  await page.reload({ waitUntil: 'networkidle' });
-
-  // Open demo project -> 3. Inputs screen
-  await page.click('[data-open-proj]');
-  await page.waitForTimeout(350);
-  await page.screenshot({ path: path.join(shotsDir, '03_inputs.png') });
-
-  // 4. Cuts Review screen
-  await page.click('.stepper-list [data-stage="cuts"]');
-  await page.waitForTimeout(350);
-  await page.screenshot({ path: path.join(shotsDir, '04_cuts_review.png') });
-
-  // 5. Scenes Grid screen
-  await page.click('.stepper-list [data-stage="scenes"]');
-  await page.waitForTimeout(350);
-  await page.screenshot({ path: path.join(shotsDir, '05_scenes_grid.png') });
-
-  // 6. Motion Studio - Zoom In with Blue Dot
-  await page.click('.stepper-list [data-stage="motion"]');
-  await page.waitForTimeout(350);
-  await page.screenshot({ path: path.join(shotsDir, '06_motion_zoom_in.png') });
-
-  // 7. Motion Studio - Zoom Out (note #1 is excluded because assigned in Zoom In!)
-  await page.click('[data-mtab="zoom_out"]');
-  await page.waitForTimeout(300);
-  // Click on stage image to place a blue dot in Zoom Out
-  const stageBox = await page.locator('#stage-image-box').boundingBox();
-  if (stageBox) {
-    await page.mouse.click(stageBox.x + stageBox.width * 0.65, stageBox.y + stageBox.height * 0.42);
-    await page.waitForTimeout(250);
-  }
-  await page.screenshot({ path: path.join(shotsDir, '07_motion_zoom_out.png') });
-
-  // 8. Export & Report screen
-  await page.click('.stepper-list [data-stage="export"]');
-  await page.waitForTimeout(350);
-  await page.screenshot({ path: path.join(shotsDir, '08_export_report.png') });
-
-  // 9. Post-result Manual Review screen
-  await page.click('.stepper-list [data-stage="review"]');
-  await page.waitForTimeout(350);
-  await page.screenshot({ path: path.join(shotsDir, '09_review_manual.png') });
-
-  // 10. Empty state (delete demo project and return home)
-  await page.click('#btn-go-home');
-  await page.waitForTimeout(250);
-  await page.click('[data-del-proj]');
-  await page.waitForTimeout(150);
-  await page.click('#m-ok');
-  await page.waitForTimeout(350);
-  await page.screenshot({ path: path.join(shotsDir, '10_home_empty.png') });
-
-  // 11. Updates Modal - Delta summary & backups (click update badge or updates button)
-  await page.click('#btn-open-updates');
-  await page.waitForTimeout(300);
-  await page.click('#upd-check-btn');
-  await page.waitForTimeout(350);
-  await page.screenshot({ path: path.join(shotsDir, '11_updates_delta.png') });
-
-  // 12. Updates Modal - Source settings + Test Connection success
-  await page.click('[data-utab="source"]');
-  await page.waitForTimeout(250);
-  await page.click('#src-test-btn');
-  await page.waitForTimeout(300);
-  await page.screenshot({ path: path.join(shotsDir, '12_updates_source.png') });
-
-  // 13. Updates Modal - Local ZIP/Folder fallback
-  await page.click('[data-utab="local"]');
-  await page.waitForTimeout(250);
-  await page.screenshot({ path: path.join(shotsDir, '13_updates_local.png') });
-  await page.click('#upd-close');
-  await page.waitForTimeout(150);
-
-  // Check layout overflow (no horizontal scroll)
-  const overflowCheck = await page.evaluate(() => ({
+async function checkOverflow(label) {
+  const res = await page.evaluate(() => ({
     scrollW: document.documentElement.scrollWidth,
     clientW: document.documentElement.clientWidth,
   }));
-  console.log('Overflow check:', overflowCheck);
+  console.log(`Overflow [${label}]:`, res);
+  if (res.scrollW > res.clientW) {
+    throw new Error(`Horizontal overflow on ${label}: ${res.scrollW} > ${res.clientW}`);
+  }
+}
+
+try {
+  // 1. Home (Blue Night default)
+  await page.goto('http://127.0.0.1:8765/', { waitUntil: 'networkidle' });
+  await page.waitForTimeout(300);
+  await checkOverflow('home_blue_night');
+  await page.screenshot({ path: path.join(shotsDir, 'v12_01_home_blue_night.png') });
+
+  // 2. Open project -> "مشروع جديد" 2x2 Materials Grid (Blue Night)
+  await page.click('[data-open-proj]');
+  await page.waitForTimeout(400);
+  await checkOverflow('inputs_blue_night');
+  await page.screenshot({ path: path.join(shotsDir, 'v12_02_inputs_blue_night.png') });
+
+  // Switch live to Calm Forest
+  await page.click('[data-theme-pick="calm_forest"]');
+  await page.waitForTimeout(250);
+  await checkOverflow('inputs_calm_forest');
+  await page.screenshot({ path: path.join(shotsDir, 'v12_03_inputs_calm_forest.png') });
+
+  // Switch live to Daylight
+  await page.click('[data-theme-pick="daylight"]');
+  await page.waitForTimeout(250);
+  await checkOverflow('inputs_daylight');
+  await page.screenshot({ path: path.join(shotsDir, 'v12_04_inputs_daylight.png') });
+
+  // Switch back to Blue Night for Screen 2
+  await page.click('[data-theme-pick="blue_night"]');
+  await page.waitForTimeout(200);
+
+  // 3. Screen 2: التفريغ (استيراد) - Preview + Suspicious lines
+  await page.click('.stepper-list [data-stage="cuts"]');
+  await page.waitForTimeout(350);
+  await checkOverflow('cuts_preview');
+  await page.screenshot({ path: path.join(shotsDir, 'v12_05_transcript_preview.png') });
+
+  // 4. Screen 2: Cuts sub-tab (shows تقدير badge)
+  await page.click('[data-cutstab="cuts"]');
+  await page.waitForTimeout(300);
+  await checkOverflow('cuts_table');
+  await page.screenshot({ path: path.join(shotsDir, 'v12_06_cuts_estimated.png') });
+
+  // 5. Screen 4: Motion Studio in Calm Forest & Daylight to confirm focus-dot stays blue (#4C8DFF)
+  await page.click('.stepper-list [data-stage="motion"]');
+  await page.waitForTimeout(350);
+  await page.click('[data-theme-pick="calm_forest"]');
+  await page.waitForTimeout(200);
+  await checkOverflow('motion_calm_forest');
+  await page.screenshot({ path: path.join(shotsDir, 'v12_07_motion_calm_forest.png') });
+
+  await page.click('[data-theme-pick="daylight"]');
+  await page.waitForTimeout(200);
+  const dotBg = await page.evaluate(() => getComputedStyle(document.getElementById('focus-dot')).backgroundColor);
+  console.log('Focus dot RGB in daylight:', dotBg);
+  await page.screenshot({ path: path.join(shotsDir, 'v12_08_motion_daylight.png') });
+
+  // 6. Settings Modal (verify NO Whisper controls)
+  await page.click('#btn-open-settings');
+  await page.waitForTimeout(200);
+  const settingsText = await page.evaluate(() => document.getElementById('modal-root').innerText);
+  if (settingsText.includes('Whisper')) {
+    throw new Error('Whisper still appears in Settings modal!');
+  }
+  await page.screenshot({ path: path.join(shotsDir, 'v12_09_settings_modal.png') });
+  await page.click('#set-close');
+  await page.waitForTimeout(150);
+
+  // 7. Create Demo Project via button from Home
+  await page.click('#btn-go-home');
+  await page.waitForSelector('#btn-demo-project');
+  await page.click('#btn-demo-project');
+  await page.waitForSelector('.material-card');
+  await page.waitForTimeout(300);
+  await checkOverflow('demo_project');
+  await page.screenshot({ path: path.join(shotsDir, 'v12_10_demo_project_inputs.png') });
 } finally {
   await browser.close();
   pyProc.kill();

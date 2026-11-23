@@ -4,5 +4,40 @@ dist/
 coverage/
 .DS_Store
 *.log
-.env*
+.env
+.env.*
 !.env.example
+
+# Python
+*.pyc
+*.pyo
+__pycache__/
+.pytest_cache/
+.venv/
+autocut/.venv/
+
+# AutoCut runtime & user data
+projects/
+autocut/projects/
+logs/
+autocut/logs/
+backups/
+autocut/backups/
+staging/
+autocut/staging/
+models/
+autocut/models/
+settings.json
+autocut/settings.json
+autocut/projects/*/output/
+
+# Exported media & audio files
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.aac

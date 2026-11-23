@@ -35,8 +35,8 @@ if not exist ".venv" (
 
 call ".venv\Scripts\activate.bat"
 
-REM 3. Install Python dependencies
-echo [2/4] Installing Python packages (FastAPI, faster-whisper, rapidfuzz, OpenCV, Pillow)...
+REM 3. Install Python dependencies (local external-transcript workflow)
+echo [2/4] Installing Python packages (FastAPI, rapidfuzz, OpenCV, Pillow)...
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 if errorlevel 1 (

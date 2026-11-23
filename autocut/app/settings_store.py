@@ -139,7 +139,7 @@ def build_problem_report(
         f"OS: {platform.system()} {platform.release()} ({platform.machine()})",
         f"Python: {sys.version.split()[0]}",
         f"FFmpeg OK: {health.get('ffmpeg_ok')} ({health.get('ffmpeg_version', '')})",
-        f"faster-whisper OK: {health.get('faster_whisper_ok')}",
+        "Transcription Mode: external import only (JSON/SRT/VTT)",
         f"rapidfuzz OK: {health.get('rapidfuzz_ok')}",
         f"Update Repo: {src.get('repo') or '(not configured)'} [branch={src.get('branch')}, subfolder={src.get('subfolder')}, token_configured={src.get('has_token')}]",
         "",

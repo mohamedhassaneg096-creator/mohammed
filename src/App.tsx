@@ -8,20 +8,20 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Download,
+  FileText,
   Film,
   FolderOpen,
   Play,
   Sliders,
-  Sun,
-  Moon,
-  Trash2,
   Terminal,
-  Download,
+  Trash2,
   X,
 } from 'lucide-react';
 
 type Stage = 'inputs' | 'cuts' | 'scenes' | 'motion' | 'export';
 type MotionType = 'zoom_in' | 'zoom_out' | 'left' | 'right';
+type ThemePreset = 'blue_night' | 'calm_forest' | 'daylight';
 
 interface CutSegment {
   id: number;
@@ -30,6 +30,7 @@ interface CutSegment {
   start: number;
   end: number;
   confidence: number;
+  estimated?: boolean;
   sceneType: 'image' | 'video';
   sceneFile: string;
   videoDuration?: number;
@@ -43,6 +44,12 @@ interface MotionAssignment {
   strength: number;
   ease: boolean;
 }
+
+const THEME_OPTIONS: { id: ThemePreset; label: string }[] = [
+  { id: 'blue_night', label: 'ليل أزرق' },
+  { id: 'calm_forest', label: 'غابة هادية' },
+  { id: 'daylight', label: 'نهار' },
+];
 
 const MOTION_TABS: { id: MotionType; label: string; icon: string }[] = [
   { id: 'zoom_in', label: 'Zoom In', icon: '⊕' },
@@ -87,6 +94,7 @@ const INITIAL_SEGMENTS: CutSegment[] = [
     start: 4.3,
     end: 6.8,
     confidence: 88,
+    estimated: true,
     sceneType: 'video',
     sceneFile: 'scene_3.mp4',
     videoDuration: 0.8,
@@ -123,7 +131,8 @@ function fmtTime(sec: number): string {
 }
 
 export default function App() {
-  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const [theme, setTheme] = useState<ThemePreset>('blue_night');
+  const [projectName, setProjectName] = useState('وثائقي الحضارة الأندلسية');
   const [stage, setStage] = useState<Stage>('inputs');
   const [rawText, setRawText] = useState(INITIAL_SCRIPT);
   const [segments, setSegments] = useState<CutSegment[]>(INITIAL_SEGMENTS);
@@ -187,20 +196,20 @@ export default function App() {
   };
 
   const runAutoPreview = () => {
-    setLiveProgress(15);
-    setLiveStatus('جاري تفريغ الصوت محلياً ومطابقة المقاطع...');
+    setLiveProgress(25);
+    setLiveStatus('جاري مطابقة النص المرقّم مع ملف التفريغ المستورد...');
     setTimeout(() => {
-      setLiveProgress(60);
-      setLiveStatus('تم إنشاء نقاط القص وتركيب المشاهد على الخط الزمني...');
-    }, 350);
+      setLiveProgress(70);
+      setLiveStatus('تم بناء نقاط القص وتركيب المشاهد على الخط الزمني...');
+    }, 300);
     setTimeout(() => {
       setLiveProgress(100);
       setLiveStatus('جاهز لتحديد حركات الصور!');
       setTimeout(() => {
         setLiveProgress(null);
         setStage('motion');
-      }, 400);
-    }, 750);
+      }, 350);
+    }, 650);
   };
 
   const handleStageClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -220,15 +229,14 @@ export default function App() {
     }));
   };
 
-  const toggleTheme = () => {
-    const next = theme === 'dark' ? 'light' : 'dark';
+  const selectTheme = (next: ThemePreset) => {
     setTheme(next);
     document.documentElement.setAttribute('data-theme', next);
   };
 
   const stages: { id: Stage; num: number; label: string }[] = [
     { id: 'inputs', num: 1, label: 'المدخلات' },
-    { id: 'cuts', num: 2, label: 'التفريغ والقص' },
+    { id: 'cuts', num: 2, label: 'التفريغ (استيراد)' },
     { id: 'scenes', num: 3, label: 'المشاهد' },
     { id: 'motion', num: 4, label: 'الحركات' },
     { id: 'export', num: 5, label: 'التصدير' },
@@ -248,8 +256,8 @@ export default function App() {
           <span
             className="w-8 h-8 rounded-lg flex items-center justify-center border"
             style={{
-              background: 'rgba(91,140,255,0.14)',
-              borderColor: 'rgba(91,140,255,0.3)',
+              background: 'rgba(108,155,255,0.14)',
+              borderColor: 'var(--border)',
               color: 'var(--accent)',
             }}
           >
@@ -260,26 +268,43 @@ export default function App() {
             className="text-xs font-mono px-2 py-0.5 rounded border"
             style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)', color: 'var(--text-muted)' }}
           >
-            v1.1.0
+            v1.2.0
           </span>
         </div>
 
-        <div className="flex items-center gap-3 text-sm">
-          <span className="font-semibold">وثائقي الحضارة الأندلسية</span>
-          <span className="text-xs text-emerald-400">تم الحفظ ✓</span>
+        <div className="hidden md:flex items-center gap-3 text-sm">
+          <span className="font-semibold">{projectName}</span>
+          <span className="text-xs font-semibold" style={{ color: 'var(--success-text)' }}>
+            تم الحفظ ✓
+          </span>
         </div>
 
         <div className="flex items-center gap-2">
-          <button
-            onClick={toggleTheme}
-            className="px-3 py-1.5 rounded-lg text-xs font-medium border flex items-center gap-1.5 cursor-pointer"
-            style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
-          >
-            {theme === 'dark' ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-            المظهر
-          </button>
           <div
-            className="px-3 py-1.5 rounded-lg text-xs font-medium border flex items-center gap-1.5"
+            className="inline-flex items-center p-0.5 rounded-lg border gap-0.5"
+            style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
+            role="group"
+            aria-label="المظهر"
+          >
+            {THEME_OPTIONS.map((t) => {
+              const active = theme === t.id;
+              return (
+                <button
+                  key={t.id}
+                  onClick={() => selectTheme(t.id)}
+                  className="px-2.5 py-1 rounded-md text-xs font-semibold cursor-pointer transition-colors"
+                  style={{
+                    background: active ? 'var(--accent-btn)' : 'transparent',
+                    color: active ? 'var(--on-accent)' : 'var(--text-muted)',
+                  }}
+                >
+                  {t.label}
+                </button>
+              );
+            })}
+          </div>
+          <div
+            className="hidden sm:flex px-3 py-1.5 rounded-lg text-xs font-medium border items-center gap-1.5"
             style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)', color: 'var(--text-muted)' }}
           >
             <Sliders className="w-3.5 h-3.5" />
@@ -303,16 +328,16 @@ export default function App() {
                   onClick={() => setStage(st.id)}
                   className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-sm font-medium border transition-colors cursor-pointer whitespace-nowrap"
                   style={{
-                    background: active ? 'rgba(91,140,255,0.14)' : 'transparent',
-                    borderColor: active ? 'rgba(91,140,255,0.35)' : 'transparent',
+                    background: active ? 'rgba(108,155,255,0.14)' : 'transparent',
+                    borderColor: active ? 'var(--border)' : 'transparent',
                     color: active ? 'var(--accent)' : done ? 'var(--text-primary)' : 'var(--text-muted)',
                   }}
                 >
                   <span
                     className="w-5 h-5 rounded text-xs font-bold inline-flex items-center justify-center tabular-nums"
                     style={{
-                      background: active ? 'var(--accent)' : done ? 'rgba(52,211,153,0.16)' : 'var(--bg-raised)',
-                      color: active ? '#fff' : done ? '#34D399' : 'var(--text-muted)',
+                      background: active ? 'var(--accent-btn)' : done ? 'rgba(87,211,155,0.16)' : 'var(--bg-raised)',
+                      color: active ? 'var(--on-accent)' : done ? 'var(--success-text)' : 'var(--text-muted)',
                     }}
                   >
                     {done ? '✓' : st.num}
@@ -339,10 +364,10 @@ export default function App() {
             <Terminal className="w-4 h-4 shrink-0" style={{ color: 'var(--accent)' }} />
             <div>
               <div className="font-semibold text-sm">
-                تشغيل البرنامج محلياً على جهازك (Windows 10/11 — مجاني 100%)
+                تشغيل AutoCut v1.2.0 محلياً على جهازك (Windows 10/11 — مجاني 100%)
               </div>
               <div className="mt-0.5" style={{ color: 'var(--text-muted)' }}>
-                يشمل نموذج التفريغ <span dir="ltr" className="font-mono">faster-whisper</span> و <span dir="ltr" className="font-mono">FFmpeg</span> و <span dir="ltr" className="font-mono">FastAPI</span> — اضغط تنزيل ثم شغّل <span dir="ltr" className="font-mono">install.bat</span> ثم <span dir="ltr" className="font-mono">run.bat</span>.
+                استيراد خارجي للتفريغ من <span dir="ltr" className="font-mono">Vibe</span> (<span dir="ltr" className="font-mono">JSON / SRT / VTT</span>) + <span dir="ltr" className="font-mono">FFmpeg</span> + <span dir="ltr" className="font-mono">FastAPI</span> — نزّل الحزمة وشغّل <span dir="ltr" className="font-mono">install.bat</span> ثم <span dir="ltr" className="font-mono">run.bat</span>.
               </div>
             </div>
           </div>
@@ -357,8 +382,8 @@ export default function App() {
             <a
               href="/autocut-windows.zip"
               download="autocut-windows.zip"
-              className="px-4 py-2 rounded-lg text-xs font-semibold text-white inline-flex items-center gap-1.5"
-              style={{ background: 'var(--accent)' }}
+              className="px-4 py-2 rounded-lg text-xs font-semibold inline-flex items-center gap-1.5"
+              style={{ background: 'var(--accent-btn)', color: 'var(--on-accent)' }}
             >
               <Download className="w-3.5 h-3.5" />
               تنزيل حزمة AutoCut (.zip)
@@ -385,103 +410,218 @@ export default function App() {
           </div>
         )}
 
-        {/* Stage 1: Inputs */}
+        {/* Stage 1: New Project 2x2 Grid */}
         {stage === 'inputs' && (
           <div>
-            <div className="flex items-center justify-between gap-4 mb-5 flex-wrap">
+            <div className="flex items-center justify-between gap-4 mb-4 flex-wrap">
               <div>
-                <h1 className="text-2xl font-bold">1. المدخلات الأساسية</h1>
+                <h1 className="text-2xl font-bold">مشروع جديد</h1>
                 <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>
-                  أضف ملف الصوت الكامل، والصق النص المرقم، وحدد مجلد المشاهد ثم اضغط التشغيل التلقائي.
+                  رتّب المواد الأربع هنا، أو أسقط مجلد المشروع دفعة واحدة ثم اضغط التشغيل.
                 </p>
               </div>
               <button
-                onClick={runAutoPreview}
-                className="px-6 py-2.5 rounded-xl font-semibold text-white cursor-pointer"
-                style={{ background: 'var(--accent)' }}
+                onClick={() => setStage('cuts')}
+                className="px-4 py-2 rounded-xl border text-xs font-semibold cursor-pointer"
+                style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
               >
-                ابدأ التشغيل التلقائي
+                فتح شاشة التفريغ (استيراد)
               </button>
             </div>
 
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <div className="space-y-5">
-                <section
-                  className="p-5 rounded-2xl border"
-                  style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
-                >
-                  <h2 className="font-semibold mb-3">1) ملف التعليق الصوتي</h2>
-                  <div
-                    className="p-4 rounded-xl border border-dashed text-center text-sm"
-                    style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
-                  >
-                    <div className="font-semibold">narration_andalus.mp3</div>
-                    <div className="text-xs mt-1 tabular-nums" style={{ color: 'var(--text-muted)' }}>
-                      المدة: 10.5 ث · جاهز بدون قص أو تعديل
-                    </div>
-                  </div>
-                </section>
-
-                <section
-                  className="p-5 rounded-2xl border"
-                  style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
-                >
-                  <h2 className="font-semibold mb-3">2) مجلد المشاهد المرقمة</h2>
-                  <div className="flex gap-2">
-                    <input
-                      readOnly
-                      dir="ltr"
-                      value="C:\Projects\Andalus\Scenes"
-                      className="flex-1 px-3 py-2 rounded-lg border text-sm font-mono"
-                      style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
-                    />
-                    <span
-                      className="px-3 py-2 rounded-lg border text-sm flex items-center gap-1.5"
-                      style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
-                    >
-                      <FolderOpen className="w-4 h-4" />
-                      5 مشاهد
-                    </span>
-                  </div>
-                </section>
-              </div>
-
-              <section
-                className="p-5 rounded-2xl border"
+            {/* Top Row: Project Name + Quick Folder */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+              <div
+                className="p-4 rounded-xl border"
                 style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
               >
-                <div className="flex items-center justify-between mb-2">
-                  <h2 className="font-semibold">3) النص المرقم (1..N)</h2>
+                <label className="block text-xs font-semibold mb-1.5">اسم المشروع</label>
+                <input
+                  value={projectName}
+                  onChange={(e) => setProjectName(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border text-sm"
+                  style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
+                />
+              </div>
+              <div
+                className="p-4 rounded-xl border border-dashed flex items-center justify-between gap-3"
+                style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
+              >
+                <div>
+                  <div className="text-sm font-bold">مشروع سريع من فولدر</div>
+                  <div className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>
+                    أسقط مجلد المشروع لتعبئة الصوت والتفريغ و<span dir="ltr" className="font-mono">script.txt</span> و<span dir="ltr" className="font-mono">scenes/</span> تلقائياً
+                  </div>
+                </div>
+                <span
+                  className="px-3 py-1.5 rounded-lg border text-xs font-semibold shrink-0"
+                  style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
+                >
+                  اختر مجلد
+                </span>
+              </div>
+            </div>
+
+            {/* 2x2 Materials Grid */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              {/* 1. Audio */}
+              <section
+                className="p-5 rounded-xl border space-y-3"
+                style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 font-bold">
+                    <span className="w-6 h-6 rounded-md text-xs flex items-center justify-center border" style={{ borderColor: 'var(--border)', background: 'var(--bg-raised)', color: 'var(--accent)' }}>1</span>
+                    الصوت
+                  </div>
+                  <span className="text-xs font-semibold px-2.5 py-0.5 rounded border" style={{ color: 'var(--success-text)', borderColor: 'var(--success-text)' }}>
+                    جاهز ✓
+                  </span>
+                </div>
+                <div
+                  className="p-3.5 rounded-xl border border-dashed text-center text-xs"
+                  style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
+                >
+                  <div className="font-semibold text-sm">narration_andalus.wav</div>
+                  <div className="mt-1 tabular-nums" style={{ color: 'var(--text-muted)' }}>
+                    المدة: 10.5 ث · يبقى الصوت أصلياً دون قص أو تعديل
+                  </div>
+                </div>
+              </section>
+
+              {/* 2. External Transcript */}
+              <section
+                className="p-5 rounded-xl border space-y-3"
+                style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 font-bold">
+                    <span className="w-6 h-6 rounded-md text-xs flex items-center justify-center border" style={{ borderColor: 'var(--border)', background: 'var(--bg-raised)', color: 'var(--accent)' }}>2</span>
+                    التفريغ
+                  </div>
+                  <span className="text-xs font-semibold px-2.5 py-0.5 rounded border" style={{ color: 'var(--success-text)', borderColor: 'var(--success-text)' }}>
+                    JSON — توقيت كل كلمة ✓
+                  </span>
+                </div>
+                <div
+                  className="p-3 rounded-lg border text-xs leading-5"
+                  style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)', color: 'var(--text-muted)' }}
+                >
+                  <strong style={{ color: 'var(--text-primary)' }}>دليل التصدير من Vibe:</strong> افتح <span dir="ltr" className="font-mono">More Options</span> ← فعّل <span dir="ltr" className="font-mono">Word timestamps</span> ← صدّر بصيغة <span dir="ltr" className="font-mono">JSON</span> (يقبل أيضاً <span dir="ltr" className="font-mono">SRT / VTT</span>).
+                </div>
+                <div className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
+                  <span dir="ltr" className="font-mono font-semibold" style={{ color: 'var(--text-primary)' }}>narration_andalus.json</span>
+                  <span className="tabular-nums">28 كلمة · التغطية 98%</span>
+                </div>
+              </section>
+
+              {/* 3. Numbered Script */}
+              <section
+                className="p-5 rounded-xl border space-y-3"
+                style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 font-bold">
+                    <span className="w-6 h-6 rounded-md text-xs flex items-center justify-center border" style={{ borderColor: 'var(--border)', background: 'var(--bg-raised)', color: 'var(--accent)' }}>3</span>
+                    النص المرقّم
+                  </div>
                   <span className="text-xs font-semibold tabular-nums" style={{ color: 'var(--accent)' }}>
-                    {parsedCount} مقاطع مكتشفة
+                    {parsedCount} مقاطع
                   </span>
                 </div>
                 <textarea
                   value={rawText}
                   onChange={(e) => setRawText(e.target.value)}
-                  rows={9}
+                  rows={5}
                   className="w-full p-3 rounded-xl border text-sm leading-7"
                   style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
                 />
+                <div className="flex items-center justify-between text-xs" style={{ color: 'var(--text-muted)' }}>
+                  <span className="inline-flex items-center gap-1"><FileText className="w-3.5 h-3.5" /> يدعم اللصق أو استيراد ملف <span dir="ltr" className="font-mono">.txt</span></span>
+                  <span>1..N</span>
+                </div>
               </section>
+
+              {/* 4. Scenes */}
+              <section
+                className="p-5 rounded-xl border space-y-3"
+                style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
+              >
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 font-bold">
+                    <span className="w-6 h-6 rounded-md text-xs flex items-center justify-center border" style={{ borderColor: 'var(--border)', background: 'var(--bg-raised)', color: 'var(--accent)' }}>4</span>
+                    المشاهد
+                  </div>
+                  <span className="text-xs font-semibold px-2.5 py-0.5 rounded border" style={{ color: 'var(--success-text)', borderColor: 'var(--success-text)' }}>
+                    5 مشاهد جاهزة ✓
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <input
+                    readOnly
+                    dir="ltr"
+                    value="C:\Projects\Andalus\scenes"
+                    className="flex-1 px-3 py-2 rounded-lg border text-xs font-mono"
+                    style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
+                  />
+                  <span
+                    className="px-3 py-2 rounded-lg border text-xs flex items-center gap-1.5"
+                    style={{ background: 'var(--bg-raised)', borderColor: 'var(--border)' }}
+                  >
+                    <FolderOpen className="w-3.5 h-3.5" />
+                    4 صور · 1 فيديو
+                  </span>
+                </div>
+              </section>
+            </div>
+
+            {/* Settings Summary + Footer CTA */}
+            <div
+              className="mt-4 px-4 py-3 rounded-xl border flex flex-wrap items-center justify-between gap-3 text-xs"
+              style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)', color: 'var(--text-muted)' }}
+            >
+              <span>الإعدادات الحالية: <strong style={{ color: 'var(--text-primary)' }}>1920×1080 · 30 fps · قوة الحركة {globalStrength}% · تمويه الخلفية</strong></span>
+              <span>مظهر: <strong style={{ color: 'var(--text-primary)' }}>{THEME_OPTIONS.find((x) => x.id === theme)?.label}</strong></span>
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={runAutoPreview}
+                  className="px-6 py-2.5 rounded-xl font-semibold cursor-pointer"
+                  style={{ background: 'var(--accent-btn)', color: 'var(--on-accent)' }}
+                >
+                  ابدأ التشغيل التلقائي
+                </button>
+                <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                  مفيش حاجة بتشتغل قبل ما تدوس
+                </span>
+              </div>
+              <button
+                onClick={() => setStage('cuts')}
+                className="px-4 py-2 rounded-xl border text-xs font-semibold cursor-pointer"
+                style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
+              >
+                مطابقة ومراجعة القص أولاً
+              </button>
             </div>
           </div>
         )}
 
-        {/* Stage 2: Cuts Review */}
+        {/* Stage 2: External Transcript Import & Cuts Review */}
         {stage === 'cuts' && (
           <div>
             <div className="flex items-center justify-between gap-4 mb-5 flex-wrap">
               <div>
-                <h1 className="text-2xl font-bold">2. مراجعة التفريغ ونقاط القص</h1>
+                <h1 className="text-2xl font-bold">2. التفريغ (استيراد) ونقاط القص</h1>
                 <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>
-                  تعديل وقت بداية أي مقطع يحدّث نهاية المقطع السابق تلقائياً.
+                  استورد ملف Vibe JSON أو SRT أو VTT؛ يتم تمييز المطابقات الوسطية في ملفات الجمل بشارة «تقدير».
                 </p>
               </div>
               <button
                 onClick={() => setStage('scenes')}
-                className="px-5 py-2.5 rounded-xl font-semibold text-white cursor-pointer"
-                style={{ background: 'var(--accent)' }}
+                className="px-5 py-2.5 rounded-xl font-semibold cursor-pointer"
+                style={{ background: 'var(--accent-btn)', color: 'var(--on-accent)' }}
               >
                 حفظ ومتابعة
               </button>
@@ -510,7 +650,7 @@ export default function App() {
                       className="border-t"
                       style={{
                         borderColor: 'var(--border)',
-                        background: s.confidence < 70 ? 'rgba(251,191,36,0.06)' : 'transparent',
+                        background: s.confidence < 70 ? 'rgba(244,184,96,0.08)' : 'transparent',
                       }}
                     >
                       <td className="p-3 font-bold tabular-nums">{s.id}</td>
@@ -543,14 +683,22 @@ export default function App() {
                       <td className="p-3 font-mono text-xs tabular-nums">{(s.end - s.start).toFixed(2)}s</td>
                       <td className="p-3">
                         <span
-                          className="px-2.5 py-0.5 rounded-full text-xs font-semibold tabular-nums"
+                          className="px-2.5 py-0.5 rounded-md text-xs font-semibold tabular-nums border"
                           style={{
-                            background: s.confidence >= 80 ? 'rgba(52,211,153,0.14)' : 'rgba(251,191,36,0.14)',
-                            color: s.confidence >= 80 ? '#34D399' : '#FBBF24',
+                            borderColor: s.confidence >= 80 ? 'var(--success-text)' : 'var(--warning-text)',
+                            color: s.confidence >= 80 ? 'var(--success-text)' : 'var(--warning-text)',
                           }}
                         >
                           {s.confidence}%
                         </span>
+                        {s.estimated && (
+                          <span
+                            className="mr-1.5 px-2 py-0.5 rounded text-[11px] font-bold border"
+                            style={{ borderColor: 'var(--warning-text)', color: 'var(--warning-text)' }}
+                          >
+                            تقدير
+                          </span>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -572,8 +720,8 @@ export default function App() {
               </div>
               <button
                 onClick={() => setStage('motion')}
-                className="px-5 py-2.5 rounded-xl font-semibold text-white cursor-pointer"
-                style={{ background: 'var(--accent)' }}
+                className="px-5 py-2.5 rounded-xl font-semibold cursor-pointer"
+                style={{ background: 'var(--accent-btn)', color: 'var(--on-accent)' }}
               >
                 متابعة إلى الحركات
               </button>
@@ -604,7 +752,7 @@ export default function App() {
                         {s.sceneFile}
                       </div>
                       {s.sceneType === 'video' && speed < 0.4 && (
-                        <div className="inline-block px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 font-semibold">
+                        <div className="inline-block px-2 py-0.5 rounded font-semibold" style={{ color: 'var(--warning-text)' }}>
                           سرعة بطيئة جداً: {speed.toFixed(2)}x
                         </div>
                       )}
@@ -623,13 +771,13 @@ export default function App() {
               <div>
                 <h1 className="text-2xl font-bold">4. حركات الصور (نقرة واحدة على نقطة التركيز)</h1>
                 <p className="text-sm mt-1" style={{ color: 'var(--text-muted)' }}>
-                  انقر لوضع النقطة الزرقاء. الصور المعينة في تبويب سابق تختفي من التبويبات التالية.
+                  انقر لوضع النقطة الزرقاء (<span dir="ltr" className="font-mono">#4C8DFF</span> ثابتة في كل المظاهر).
                 </p>
               </div>
               <button
                 onClick={() => setStage('export')}
-                className="px-6 py-2.5 rounded-xl font-semibold text-white cursor-pointer"
-                style={{ background: 'var(--accent)' }}
+                className="px-6 py-2.5 rounded-xl font-semibold cursor-pointer"
+                style={{ background: 'var(--accent-btn)', color: 'var(--on-accent)' }}
               >
                 تنفيذ الحركات والتصدير
               </button>
@@ -649,8 +797,8 @@ export default function App() {
                       onClick={() => setMotionTab(t.id)}
                       className="px-3.5 py-1.5 rounded-lg text-xs font-semibold cursor-pointer flex items-center gap-1.5"
                       style={{
-                        background: active ? 'var(--accent)' : 'transparent',
-                        color: active ? '#fff' : 'var(--text-muted)',
+                        background: active ? 'var(--accent-btn)' : 'transparent',
+                        color: active ? 'var(--on-accent)' : 'var(--text-muted)',
                       }}
                     >
                       <span>{t.icon}</span>
@@ -720,7 +868,7 @@ export default function App() {
                       <div
                         className="absolute w-6 h-6 -translate-x-1/2 -translate-y-1/2 rounded-full border-[3px] border-white focus-dot-pulse pointer-events-none"
                         style={{
-                          background: '#5B8CFF',
+                          background: '#4C8DFF',
                           left: `${assignments[activeImage.id].x * 100}%`,
                           top: `${assignments[activeImage.id].y * 100}%`,
                         }}
@@ -816,7 +964,7 @@ export default function App() {
               </div>
               <div className="p-4 rounded-xl border" style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}>
                 <div className="text-xs" style={{ color: 'var(--text-muted)' }}>حالة التطابق</div>
-                <div className="text-lg font-bold text-emerald-400 mt-1 flex items-center gap-1.5">
+                <div className="text-lg font-bold mt-1 flex items-center gap-1.5" style={{ color: 'var(--success-text)' }}>
                   <Check className="w-5 h-5" />
                   صفر فجوات
                 </div>
@@ -832,7 +980,7 @@ export default function App() {
                 تشغيل المشروع محلياً على جهاز ويندوز
               </div>
               <p style={{ color: 'var(--text-muted)' }}>
-                يتم التصدير الفعلي عبر FFmpeg و <span dir="ltr" className="font-mono">faster-whisper</span> محلياً من مجلد <span dir="ltr" className="font-mono">autocut/</span> لضمان العمل 100% بدون إنترنت وبأقصى سرعة على المعالج.
+                يتم التصدير الفعلي محلياً عبر <span dir="ltr" className="font-mono">FFmpeg</span> بعد استيراد ملف التفريغ من <span dir="ltr" className="font-mono">Vibe</span> (<span dir="ltr" className="font-mono">JSON / SRT / VTT</span>) لضمان العمل 100% بدون إنترنت وبأقصى سرعة على المعالج.
               </p>
             </div>
           </div>
@@ -851,7 +999,7 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-lg font-bold">تثبيت وتشغيل AutoCut على جهازك</h3>
+              <h3 className="text-lg font-bold">تثبيت وتشغيل AutoCut v1.2.0 على جهازك</h3>
               <button
                 onClick={() => setShowInstallModal(false)}
                 className="p-1.5 rounded-lg border cursor-pointer"
@@ -866,21 +1014,16 @@ export default function App() {
                 اضغط زر <strong>تنزيل حزمة AutoCut (.zip)</strong> ثم فك الضغط عنها في أي مجلد (مثلاً <span dir="ltr" className="font-mono">C:\autocut</span>).
               </li>
               <li>
-                تأكد من وجود <strong>Python 3.11</strong> (أو أحدث) على ويندوز مع تفعيل خيار <span dir="ltr" className="font-mono">Add Python to PATH</span> أثناء التثبيت.
+                تأكد من وجود <strong>Python 3.11</strong> (أو أحدث) على ويندوز مع تفعيل خيار <span dir="ltr" className="font-mono">Add Python to PATH</span>.
               </li>
               <li>
-                افتح المجلد واضغط مرتين على <span dir="ltr" className="font-mono font-semibold">install.bat</span> — سيقوم تلقائياً بتثبيت وربط:
-                <ul className="mt-1 mr-5 list-disc text-xs space-y-1" style={{ color: 'var(--text-muted)' }}>
-                  <li>نموذج التفريغ الصوتي <span dir="ltr" className="font-mono">faster-whisper</span> (يعمل على المعالج CPU بدون كارت شاشة)</li>
-                  <li>أداة دمج الفيديو <span dir="ltr" className="font-mono">FFmpeg</span></li>
-                  <li>محرك المطابقة <span dir="ltr" className="font-mono">rapidfuzz</span> وخادم <span dir="ltr" className="font-mono">FastAPI</span></li>
-                </ul>
+                اضغط مرتين على <span dir="ltr" className="font-mono font-semibold">install.bat</span> لتثبيت <span dir="ltr" className="font-mono">FastAPI</span> و<span dir="ltr" className="font-mono">rapidfuzz</span> و<span dir="ltr" className="font-mono">OpenCV</span> و<span dir="ltr" className="font-mono">FFmpeg</span> (خفيف وسريع بدون حزم تفريغ ثقيلة).
               </li>
               <li>
-                بعد انتهاء التثبيت، اضغط مرتين على <span dir="ltr" className="font-mono font-semibold">run.bat</span> — سيفتح المتصفح تلقائياً على <span dir="ltr" className="font-mono">http://127.0.0.1:8000</span> وجاهز للعمل فوراً.
+                فرّغ صوتك خارجياً في برنامج <strong>Vibe</strong> (من <span dir="ltr" className="font-mono">More Options</span> ← فعّل <span dir="ltr" className="font-mono">Word timestamps</span> ← صدّر <span dir="ltr" className="font-mono">JSON</span>) ثم استورده في AutoCut أو أسقط مجلد المشروع دفعة واحدة.
               </li>
               <li>
-                <strong>التحديثات السريعة من GitHub (v1.1.0):</strong> من داخل التطبيق افتح <strong>التحديثات ← المصدر</strong> وأدخل مستودعك لتحديث الملفات المتغيرة فقط بنقرة واحدة مع نسخ احتياطي وتراجع تلقائي، أو حدّث محلياً من ملف <span dir="ltr" className="font-mono">.zip</span>.
+                بعد التثبيت، اضغط مرتين على <span dir="ltr" className="font-mono font-semibold">run.bat</span> لفتح <span dir="ltr" className="font-mono">http://127.0.0.1:8000</span>، وللحصول على التحديثات المستقبلية استخدم <strong>التحديثات ← المصدر</strong> من GitHub بنقرة واحدة.
               </li>
             </ol>
 
@@ -888,8 +1031,8 @@ export default function App() {
               <a
                 href="/autocut-windows.zip"
                 download="autocut-windows.zip"
-                className="px-4 py-2 rounded-xl text-sm font-semibold text-white inline-flex items-center gap-2"
-                style={{ background: 'var(--accent)' }}
+                className="px-4 py-2 rounded-xl text-sm font-semibold inline-flex items-center gap-2"
+                style={{ background: 'var(--accent-btn)', color: 'var(--on-accent)' }}
               >
                 <Download className="w-4 h-4" />
                 تنزيل الحزمة الآن (.zip)

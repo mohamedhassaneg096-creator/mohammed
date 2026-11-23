@@ -11,6 +11,7 @@
     "launcher.py",
     "create_shortcut.bat",
     "README.md",
+    "settings.example.json",
     "update_manifest.json"
   ],
   "ignore_patterns": [
