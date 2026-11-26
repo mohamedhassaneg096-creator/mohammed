@@ -12,8 +12,11 @@
     "height": 1080,
     "fps": 30,
     "default_motion_strength": 15,
+    "default_motion_duration": 3.5,
     "background_fill": "blurred",
     "slowmo_smooth": "off",
+    "resource_mode": "light",
+    "auto_slice_audio": true,
     "theme": "blue_night",
     "aspect_preset": "16:9"
   }

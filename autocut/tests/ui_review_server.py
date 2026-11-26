@@ -1,4 +1,4 @@
-"""Local stdlib HTTP bridge for Playwright UI self-review across all 3 themes in v1.2.0."""
+"""Local stdlib HTTP bridge for Playwright UI self-review across all 3 themes in v1.3.0."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ from app.project import (
     save_project,
     save_transcript,
 )
-from app.render import export_timeline_video
+from app.render import export_single_scene_with_audio, export_timeline_video, slice_audio_into_clips
 from app.scenes import scan_scenes_folder
 from app.settings_store import (
     build_problem_report,
@@ -55,7 +55,7 @@ SIMULATED_UPDATE_SETTINGS = {"file": None}
 
 
 def seed_demo_project(projects_root: Path) -> str:
-    """Create a realistic Arabic project with imported transcript, suspicious line, estimated cut, scenes, motions, and final.mp4."""
+    """Create a realistic Arabic project with imported transcript, suspicious line, sliced audio clips, scenes, motions, and final.mp4."""
     proj = create_project("وثائقي الحضارة الأندلسية", projects_root=projects_root)
     pid = proj["id"]
     pdir = get_project_dir(pid, projects_root)
@@ -79,7 +79,6 @@ def seed_demo_project(projects_root: Path) -> str:
     parsed = parse_numbered_segments(raw_text)
     scan = scan_scenes_folder(pid, scenes_dir, segment_ids=[s["id"] for s in parsed["segments"]], projects_root=projects_root)
 
-    # Use sentence-level SRT with 1 duplicate/Latin suspicious line so Screen 2 displays both badges + suspicious toggle!
     srt_text = (
         "1\n00:00:00,000 --> 00:00:01,500\nفي قلب الأندلس بدأت قصة حضارة مضيئة\n\n"
         "2\n00:00:01,550 --> 00:00:03,400\nكانت قرطبة مركزاً للعلم والعمارة والفنون\n\n"
@@ -97,6 +96,9 @@ def seed_demo_project(projects_root: Path) -> str:
     cuts["segments"][3]["confidence"] = 58.0
     save_cuts(pid, cuts, projects_root=projects_root)
 
+    settings = {**proj["settings"], "resolution": "640x360", "width": 640, "height": 360, "fps": 24}
+    audio_clips = slice_audio_into_clips(pid, audio_path=audio_path, cuts=cuts, settings=settings, projects_root=projects_root)
+
     motions = {
         "global_strength": 15,
         "assignments": {
@@ -105,7 +107,6 @@ def seed_demo_project(projects_root: Path) -> str:
     }
     save_motions(pid, motions, projects_root=projects_root)
 
-    settings = {**proj["settings"], "resolution": "640x360", "width": 640, "height": 360, "fps": 24}
     tl = build_timeline(cuts, scan["scenes"], fps=24)
     report = export_timeline_video(
         project_id=pid,
@@ -122,6 +123,7 @@ def seed_demo_project(projects_root: Path) -> str:
             "audio_filename": audio_path.name,
             "audio_hash": file_sha256(audio_path),
             "audio_duration": 8.0,
+            "audio_clips": audio_clips,
             "transcript_filename": transcript["filename"],
             "transcript_precision": transcript["precision"],
             "scenes_dir": str(scenes_dir),
@@ -171,6 +173,16 @@ def make_handler(projects_root: Path):
             parsed = urlparse(self.path)
             path = unquote(parsed.path)
 
+            if path == "/manifest.json":
+                self._send_file(WEB_DIR / "manifest.json", "application/manifest+json")
+                return
+            if path == "/sw.js":
+                self._send_file(WEB_DIR / "sw.js", "application/javascript")
+                return
+            if path in ("/icon.svg", "/pwa-192x192.png", "/pwa-512x512.png", "/pwa-maskable-512x512.png", "/apple-touch-icon.png"):
+                self._send_file(WEB_DIR / "icons" / path.lstrip("/"))
+                return
+
             if path == "/api/health":
                 self._send_json(200, {
                     "ok": not SIMULATED_MISSING_FFMPEG["flag"],
@@ -203,9 +215,9 @@ def make_handler(projects_root: Path):
                     "ok": True,
                     "configured": True,
                     "local_version": get_app_version(),
-                    "remote_version": "1.2.1",
+                    "remote_version": "1.3.1",
                     "update_available": True,
-                    "commit_date": "2026-11-22T12:00:00Z",
+                    "commit_date": "2026-11-25T12:00:00Z",
                     "subfolder": "autocut",
                 })
                 return
@@ -215,11 +227,11 @@ def make_handler(projects_root: Path):
                     "ok": True,
                     "backups": [
                         {
-                            "id": "1.1.0_20261122_100000",
-                            "old_version": "1.1.0",
-                            "target_version": "1.2.0",
-                            "created_at": "2026-11-22T10:00:00Z",
-                            "file_count": 6,
+                            "id": "1.2.0_20261125_100000",
+                            "old_version": "1.2.0",
+                            "target_version": "1.3.0",
+                            "created_at": "2026-11-25T10:00:00Z",
+                            "file_count": 8,
                         }
                     ],
                 })
@@ -247,6 +259,7 @@ def make_handler(projects_root: Path):
                         "timeline": tl,
                         "motions": motions,
                         "transcript": transcript,
+                        "audio_clips": meta.get("audio_clips") or [],
                         "has_transcript": transcript is not None,
                         "has_output": has_out,
                     })
@@ -254,6 +267,14 @@ def make_handler(projects_root: Path):
                 if parts[1] == "audio":
                     meta = load_project(pid, projects_root)
                     self._send_file(Path(meta["audio_path"]))
+                    return
+                if parts[1] == "audio-clips" and len(parts) == 3:
+                    seg_id = int(parts[2])
+                    matches = sorted((get_project_dir(pid, projects_root) / "audio_clips").glob(f"clip_{seg_id}_*.m4a"))
+                    if matches:
+                        self._send_file(matches[-1], "audio/mp4")
+                    else:
+                        self.send_error(404)
                     return
                 if parts[1] == "thumbnails" and len(parts) == 3:
                     self._send_file(get_project_dir(pid, projects_root) / "thumbnails" / Path(parts[2]).name)
@@ -267,7 +288,8 @@ def make_handler(projects_root: Path):
                         self.send_error(404)
                     return
                 if parts[1] == "output" and len(parts) == 3:
-                    self._send_file(get_project_dir(pid, projects_root) / "output" / "final.mp4", "video/mp4")
+                    fname = Path(parts[2]).name
+                    self._send_file(get_project_dir(pid, projects_root) / "output" / fname, "video/mp4")
                     return
                 if parts[1] == "previews" and len(parts) == 3:
                     self._send_file(get_project_dir(pid, projects_root) / "previews" / Path(parts[2]).name, "video/mp4")
@@ -290,14 +312,18 @@ def make_handler(projects_root: Path):
                 self._send_json(200, {"ok": True})
                 return
 
+            if path.startswith("/api/jobs/") and (path.endswith("/pause") or path.endswith("/resume")):
+                self._send_json(200, {"ok": True, "paused": path.endswith("/pause")})
+                return
+
             if path == "/api/updates/test-connection":
                 self._send_json(200, {
                     "ok": True,
                     "repo": body.get("repo") or "demo/autocut",
                     "branch": body.get("branch") or "main",
                     "subfolder": "autocut",
-                    "remote_version": "1.2.1",
-                    "commit_date": "2026-11-22T12:00:00Z",
+                    "remote_version": "1.3.1",
+                    "commit_date": "2026-11-25T12:00:00Z",
                 })
                 return
 
@@ -306,15 +332,15 @@ def make_handler(projects_root: Path):
                     "ok": True,
                     "source": "github",
                     "local_version": get_app_version(),
-                    "remote_version": "1.2.1",
+                    "remote_version": "1.3.1",
                     "update_available": True,
-                    "commit_date": "2026-11-22T12:00:00Z",
+                    "commit_date": "2026-11-25T12:00:00Z",
                     "subfolder": "autocut",
-                    "changelog": ["1.2.1", "تحسينات واجهة الاستيراد."],
-                    "commits": ["feat: v1.2 external transcript polish"],
+                    "changelog": ["1.3.1", "تحسينات قص الصوت الفوري ومعاينة الحركة."],
+                    "commits": ["feat: v1.3 pwa & 2-stage pipeline"],
                     "to_download": [{"relpath": "VERSION", "sha": "abc", "size": 6}],
                     "to_delete": [],
-                    "unchanged_count": 24,
+                    "unchanged_count": 26,
                     "change_count": 1,
                     "total_bytes": 6,
                     "total_mb": 0.001,
@@ -383,10 +409,38 @@ def make_handler(projects_root: Path):
                     parsed = parse_numbered_segments(raw_text)
                     cuts = match_segments_to_transcript(parsed["segments"], tr, audio_duration=float(meta.get("audio_duration") or 8.0))
                     save_cuts(pid, cuts, projects_root=projects_root)
+                    clips = []
+                    if meta.get("audio_path") and Path(meta["audio_path"]).exists():
+                        clips = slice_audio_into_clips(pid, Path(meta["audio_path"]), cuts, settings=meta.get("settings") or {}, projects_root=projects_root)
                     tl = build_timeline(cuts, (meta.get("scenes_scan") or {}).get("scenes") or {}, fps=int(meta["settings"]["fps"]))
                     nxt = "motion" if body.get("auto_mode") else "cuts"
-                    meta = save_project(pid, {"raw_text": raw_text, "stage": nxt}, projects_root=projects_root)
-                    self._send_json(200, {"ok": True, "project": meta, "cuts": cuts, "timeline": tl, "scenes_scan": meta.get("scenes_scan")})
+                    meta = save_project(pid, {"raw_text": raw_text, "stage": nxt, "audio_clips": clips}, projects_root=projects_root)
+                    self._send_json(200, {"ok": True, "project": meta, "cuts": cuts, "timeline": tl, "scenes_scan": meta.get("scenes_scan"), "audio_clips": clips})
+                    return
+                if len(parts) >= 2 and parts[1] == "slice-audio":
+                    meta = load_project(pid, projects_root)
+                    cuts = load_cuts(pid, projects_root)
+                    clips = slice_audio_into_clips(pid, Path(meta["audio_path"]), cuts, settings=meta.get("settings") or {}, projects_root=projects_root)
+                    meta = save_project(pid, {"audio_clips": clips}, projects_root=projects_root)
+                    self._send_json(200, {"ok": True, "audio_clips": clips, "project": meta})
+                    return
+                if len(parts) >= 3 and parts[1] == "export-scene":
+                    seg_id = int(parts[2])
+                    meta = load_project(pid, projects_root)
+                    cuts = load_cuts(pid, projects_root)
+                    tl = build_timeline(cuts, (meta.get("scenes_scan") or {}).get("scenes") or {}, fps=int(meta["settings"]["fps"]))
+                    item = next(it for it in tl["items"] if int(it["segment_id"]) == seg_id)
+                    motions = load_motions(pid, projects_root)
+                    motion = (motions.get("assignments") or {}).get(str(seg_id))
+                    res = export_single_scene_with_audio(
+                        project_id=pid,
+                        item=item,
+                        audio_path=Path(meta["audio_path"]),
+                        settings=meta["settings"],
+                        motion=motion,
+                        projects_root=projects_root,
+                    )
+                    self._send_json(200, res)
                     return
                 if len(parts) >= 4 and parts[1] == "cuts" and parts[3] == "start":
                     seg_id = int(parts[2])

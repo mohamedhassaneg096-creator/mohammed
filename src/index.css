@@ -73,3 +73,10 @@ body {
 .focus-dot-pulse {
   animation: dotPulse 1.8s ease-in-out infinite;
 }
+
+.smooth-scroll-x {
+  scroll-behavior: smooth;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+

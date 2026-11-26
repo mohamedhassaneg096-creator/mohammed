@@ -25,8 +25,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "fps": 30,
     "max_video_speed_change": 2.0,
     "default_motion_strength": 15,  # Section 5 specifies 15% default (5-40% range)
+    "default_motion_duration": 3.5, # Default live/preview motion duration (3-4s)
     "background_fill": "blurred",    # "blurred" | "black"
     "slowmo_smooth": "off",          # "off" | "blend" | "mci"
+    "resource_mode": "light",        # "light" (default) | "medium" | "fast"
+    "auto_slice_audio": True,        # Stage 1 immediate audio slicing
     "theme": "blue_night",           # "blue_night" | "calm_forest" | "daylight"
     # Future-ready fields (Section 12)
     "aspect_preset": "16:9",
@@ -113,7 +116,7 @@ def create_project(name: str, projects_root: Optional[Path] = None) -> Dict[str,
     root.mkdir(parents=True, exist_ok=True)
     pid = f"{_safe_slug(name)}_{uuid.uuid4().hex[:6]}"
     pdir = root / pid
-    for sub in ("audio", "cache", "thumbnails", "output", "previews"):
+    for sub in ("audio", "audio_clips", "cache", "thumbnails", "output", "previews"):
         (pdir / sub).mkdir(parents=True, exist_ok=True)
 
     now = _utc_now_iso()
@@ -127,6 +130,7 @@ def create_project(name: str, projects_root: Optional[Path] = None) -> Dict[str,
         "audio_filename": None,
         "audio_hash": None,
         "audio_duration": 0.0,
+        "audio_clips": [],
         "transcript_filename": None,
         "transcript_precision": None,
         "scenes_dir": "",

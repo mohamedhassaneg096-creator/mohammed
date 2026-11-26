@@ -4,6 +4,15 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>أوتوكَت | AutoCut — تجميع الفيديو التلقائي</title>
+  <meta name="description" content="أداة محلية خفيفة لتجميع الفيديو تلقائياً مع قص الصوت الفوري وتحريك المشاهد" />
+  <meta name="theme-color" content="#0F1218" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="AutoCut" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -19,16 +28,21 @@
           </svg>
         </span>
         <span class="brand-title">أوتوكَت · AutoCut</span>
-        <span id="app-version-tag" class="version-tag mono">v1.2.0</span>
+        <span id="app-version-tag" class="version-tag mono">v1.3.0</span>
       </div>
 
       <div class="topbar-center">
         <span id="top-project-name" class="project-name-label hidden"></span>
         <span id="top-save-status" class="save-indicator hidden">تم الحفظ ✓</span>
+        <span id="offline-indicator" class="offline-badge hidden">وضع أوفلاين</span>
         <button class="update-badge hidden" id="btn-update-badge" title="انقر لعرض تفاصيل التحديث المتاح"></button>
       </div>
 
       <div class="topbar-actions">
+        <button class="btn btn-sm btn-primary hidden" id="btn-install-pwa" title="تثبيت التطبيق على جهازك للعمل كتطبيق مستقل">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12"/><polyline points="7 10 12 15 17 10"/><rect x="4" y="17" width="16" height="4" rx="1"/></svg>
+          تثبيت التطبيق
+        </button>
         <div class="theme-switcher" id="theme-switcher" role="group" aria-label="المظهر">
           <button class="theme-opt active" data-theme-pick="blue_night" title="ليل أزرق (الافتراضي)">ليل أزرق</button>
           <button class="theme-opt" data-theme-pick="calm_forest" title="غابة هادية">غابة هادية</button>
@@ -58,7 +72,7 @@
       <div class="stepper-list">
         <button class="step-btn" data-stage="inputs"><span class="step-num tabular">1</span>المدخلات</button>
         <span class="step-arrow">←</span>
-        <button class="step-btn" data-stage="cuts"><span class="step-num tabular">2</span>التفريغ (استيراد)</button>
+        <button class="step-btn" data-stage="cuts"><span class="step-num tabular">2</span>التفريغ وقص الصوت</button>
         <span class="step-arrow">←</span>
         <button class="step-btn" data-stage="scenes"><span class="step-num tabular">3</span>المشاهد</button>
         <span class="step-arrow">←</span>
@@ -93,13 +107,15 @@
       <!-- Live Pipeline Banner -->
       <div id="live-banner" class="live-banner hidden">
         <div class="live-banner-top">
-          <div>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <span id="live-stage-pill" class="stage-pill-badge">مرحلة 1/2</span>
             <div id="live-status-text" class="live-status-text">جاري التنفيذ...</div>
           </div>
           <div class="live-metrics">
             <span id="live-pct" class="tabular">0%</span>
             <span id="live-elapsed" class="mono">00:00</span>
             <span id="live-eta" class="mono">المتبقي: --:--</span>
+            <button class="btn btn-sm" id="btn-pause-job">إيقاف مؤقت</button>
             <button class="btn btn-sm btn-danger" id="btn-cancel-job">إلغاء</button>
           </div>
         </div>

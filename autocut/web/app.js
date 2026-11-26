@@ -1,4 +1,4 @@
-/* AutoCut Frontend Application — v1.2.0 (Arabic RTL, Offline, External Transcript Import) */
+/* AutoCut Frontend Application — v1.3.0 (Arabic RTL, Offline PWA, 2-Stage Pipeline, Live Motion) */
 
 (() => {
   "use strict";
@@ -8,7 +8,14 @@
     { id: "zoom_out", label: "Zoom Out", ar: "تبعيد", icon: "⊖" },
     { id: "left", label: "Left", ar: "تحريك لليسار", icon: "⇠" },
     { id: "right", label: "Right", ar: "تحريك لليمين", icon: "⇢" },
+    { id: "snap_zoom", label: "حركة خاطفة", ar: "حركة خاطفة", icon: "⚡" },
   ];
+
+  const RESOURCE_MODES = {
+    light: "خفيف",
+    medium: "متوسط",
+    fast: "سريع",
+  };
 
   const THEMES = {
     blue_night: "ليل أزرق",
@@ -41,6 +48,11 @@
     motionCurrentSegId: null,
     motionHistory: [],
     previewVideoUrl: null,
+    liveAnimRaf: null,
+    liveAnimatingSegId: null,
+    sceneOutputs: {}, // seg_id -> output url
+    sliceClipPlayingId: null,
+    deferredInstallPrompt: null,
     reviewSelectedSegId: null,
     globalSettings: null,
     updateModalTab: "updates",
@@ -51,6 +63,43 @@
     updateTestResult: null,
     backups: [],
   };
+
+  // ---------- IndexedDB Local Auto-Save (preserves draft/motions/cuts offline) ----------
+  const IDB_NAME = "autocut_local_db";
+  const IDB_STORE = "project_snapshots";
+
+  function openAutoCutIDB() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) return reject(new Error("IndexedDB unavailable"));
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          db.createObjectStore(IDB_STORE, { keyPath: "id" });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function saveSnapshotIDB() {
+    if (!state.project?.id) return;
+    try {
+      const db = await openAutoCutIDB();
+      const tx = db.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).put({
+        id: state.project.id,
+        updatedAt: Date.now(),
+        view: state.view,
+        project: state.project,
+        cuts: state.cuts,
+        motions: state.motions,
+      });
+    } catch {
+      // non-blocking IDB save
+    }
+  }
 
   // ---------- Helpers ----------
   function esc(val) {
@@ -107,9 +156,11 @@
 
   function markSaved() {
     const ind = document.getElementById("top-save-status");
-    if (!ind) return;
-    ind.classList.remove("hidden");
-    ind.textContent = "تم الحفظ ✓";
+    if (ind) {
+      ind.classList.remove("hidden");
+      ind.textContent = "تم الحفظ ✓";
+    }
+    saveSnapshotIDB();
   }
 
   async function api(url, opts = {}) {
@@ -437,7 +488,7 @@
     await navigate(stage === "home" ? "inputs" : stage);
   }
 
-  // ---------- Live Job Polling (Export) ----------
+  // ---------- Live Job Polling (Stage 1 Slicing + Stage 2 Export + Pause/Resume) ----------
   function renderLiveBanner() {
     const banner = document.getElementById("live-banner");
     const job = state.activeJob;
@@ -447,6 +498,18 @@
     }
 
     banner.classList.remove("hidden");
+    const stagePill = document.getElementById("live-stage-pill");
+    if (stagePill) {
+      stagePill.textContent = job.stage_num === 1 || job.type === "slice_audio"
+        ? "المرحلة 1/2: قص الصوت"
+        : "المرحلة 2/2: تركيب وتصدير";
+    }
+    const pauseBtn = document.getElementById("btn-pause-job");
+    if (pauseBtn) {
+      pauseBtn.textContent = job.paused ? "استئناف ▶" : "إيقاف مؤقت ⏸";
+      pauseBtn.classList.toggle("btn-primary", Boolean(job.paused));
+    }
+
     document.getElementById("live-status-text").textContent = job.message || "جاري التنفيذ...";
     document.getElementById("live-pct").textContent = `${Math.round(job.progress || 0)}%`;
     document.getElementById("live-elapsed").textContent = fmtTime(job.elapsed || 0);
@@ -455,7 +518,7 @@
     document.getElementById("live-progress-fill").style.width = `${Math.min(100, job.progress || 0)}%`;
 
     const strip = document.getElementById("live-timeline-strip");
-    const items = (job.timeline?.items) || (state.timeline?.items) || [];
+    const items = (job.timeline?.items) || (state.timeline?.items) || (state.cuts?.segments) || [];
     if (items.length > 0) {
       strip.classList.remove("hidden");
       strip.innerHTML = items.slice(0, 60).map((it) => {
@@ -480,6 +543,9 @@
         const data = await api(`/api/jobs/${jobId}`);
         const job = data.job;
         state.activeJob = job;
+        if (job.type === "slice_audio" && Array.isArray(job.audio_clips) && state.project) {
+          state.project.audio_clips = job.audio_clips;
+        }
         renderLiveBanner();
 
         if (job.status === "done") {
@@ -502,7 +568,38 @@
         state.pollTimer = null;
         toast(err.message, "error");
       }
-    }, 600);
+    }, 550);
+  }
+
+  async function triggerImmediateAudioSlice(showToast = true) {
+    if (!state.project) return;
+    try {
+      const res = await apiJson(`/api/projects/${state.project.id}/slice-audio`, "POST", {});
+      if (res.job_id) {
+        state.activeJob = {
+          id: res.job_id,
+          type: "slice_audio",
+          stage_num: 1,
+          paused: false,
+          status: "running",
+          progress: 2,
+          message: "المرحلة 1: جاري قص الصوت فوراً إلى مقاطع مرقمة...",
+          clip_states: {},
+        };
+        renderLiveBanner();
+        if (showToast) toast("بدأ قص الصوت فوراً (المرحلة 1)...", "info");
+        startJobPolling(res.job_id, (job) => {
+          if (state.project && job.audio_clips) {
+            state.project.audio_clips = job.audio_clips;
+          }
+          markSaved();
+          toast("اكتمل قص المقاطع الصوتية بنجاح!", "success");
+          render();
+        });
+      }
+    } catch (err) {
+      toast(err.message, "error");
+    }
   }
 
   // ---------- Transcript Import Shared Handlers ----------
@@ -982,7 +1079,9 @@
           <span>·</span>
           <span><strong class="tabular">${p.settings.fps} fps</strong></span>
           <span>·</span>
-          <span>قوة الحركة <strong class="tabular">${p.settings.default_motion_strength}%</strong></span>
+          <span>استهلاك الجهاز: <strong>${esc(RESOURCE_MODES[p.settings.resource_mode || "light"] || "خفيف")}</strong></span>
+          <span>·</span>
+          <span>مدة الحركة <strong class="mono">${Number(p.settings.default_motion_duration ?? 3.5).toFixed(1)}s</strong></span>
           <span>·</span>
           <span><strong>${esc(bgLabel)}</strong></span>
         </div>
@@ -1295,11 +1394,32 @@
         state.timeline = res.timeline;
         if (res.scenes_scan) state.project.scenes_scan = res.scenes_scan;
         markSaved();
+        if (res.slice_job_id) {
+          state.activeJob = {
+            id: res.slice_job_id,
+            type: "slice_audio",
+            stage_num: 1,
+            paused: false,
+            status: "running",
+            progress: 2,
+            message: "المرحلة 1: بدء قص الصوت فوراً...",
+            clip_states: {},
+          };
+          renderLiveBanner();
+          startJobPolling(res.slice_job_id, (job) => {
+            if (state.project && job.audio_clips) {
+              state.project.audio_clips = job.audio_clips;
+            }
+            markSaved();
+            toast("اكتمل قص المقاطع الصوتية (المرحلة 1)!", "success");
+            render();
+          });
+        }
         if (autoMode) {
-          toast("تمت المطابقة وتركيب المشاهد! حدد الحركات على الصور الآن.", "success");
+          toast("بدأ قص الصوت فوراً وتركيب المشاهد! حدد الحركات على الصور الآن.", "success");
           await navigate("motion");
         } else {
-          toast("تم بناء نقاط القص! يمكنك مراجعتها وتعديلها.", "success");
+          toast("تم بناء نقاط القص وبدء قص الصوت (المرحلة 1)!", "success");
           state.cutsSubTab = "cuts";
           await navigate("cuts");
         }
@@ -1451,14 +1571,45 @@
       `;
     }
 
+    const audioClips = p.audio_clips || [];
+    const capcutTrackHtml = segs.length ? `
+      <section class="capcut-timeline-card">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+          <div>
+            <strong style="font-size:14.5px">المرحلة 1: خط الصوت المقصوص بأسلوب CapCut (<span class="tabular">${audioClips.length}/${segs.length}</span> مقطع جاهز)</strong>
+            <div class="field-hint" style="margin-top:2px">يبدأ قص الصوت فورياً لتخفيف الرامات على الفيديوهات الطويلة. انقر على أي مقطع لتشغيله.</div>
+          </div>
+          <button class="btn btn-sm btn-primary" id="btn-slice-audio-now">قص الصوت الآن ✂</button>
+        </div>
+        <div class="capcut-track-scroll">
+          ${segs.map((s) => {
+            const clip = audioClips.find((c) => Number(c.segment_id) === Number(s.id));
+            const widthPx = Math.max(108, Math.min(260, Math.round(Number(s.duration || 1.5) * 32)));
+            return `<div class="capcut-clip-block ${clip ? "sliced" : ""}" style="width:${widthPx}px" data-play-slice="${s.id}" data-slice-start="${Number(s.start)}" title="تشغيل مقطع ${s.id}">
+              <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px">
+                <strong class="tabular">مقطع ${s.id}</strong>
+                <span class="mono" style="font-size:11px">${Number(s.duration).toFixed(1)}s</span>
+              </div>
+              <div class="capcut-clip-bars">
+                <span style="height:45%"></span><span style="height:85%"></span><span style="height:60%"></span><span style="height:95%"></span><span style="height:50%"></span><span style="height:75%"></span>
+              </div>
+              <div style="font-size:11px;color:${clip ? "var(--success-text)" : "var(--text-2)"};font-weight:600">
+                ${clip ? "✓ مقصوص وجاهز" : "▶ استماع مباشر"}
+              </div>
+            </div>`;
+          }).join("")}
+        </div>
+      </section>
+    ` : "";
+
     outlet.innerHTML = `
       <div class="section-header">
         <div>
-          <h1 class="section-title">2. التفريغ (استيراد) ونقاط القص</h1>
-          <p class="section-subtitle">استورد تفريغ Vibe أو Whisper، راجع السطور المشبوهة، واضبط نقاط القص بدقة.</p>
+          <h1 class="section-title">2. التفريغ وقص الصوت (المرحلة 1)</h1>
+          <p class="section-subtitle">استورد تفريغ Vibe أو Whisper، راجع السطور المشبوهة، ويبدأ قص الصوت فوراً على مقاطع خفيفة.</p>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn" id="btn-cuts-rematch">مطابقة وبناء نقاط القص</button>
+          <button class="btn" id="btn-cuts-rematch">مطابقة وقص الصوت</button>
           <button class="btn btn-primary btn-lg" id="btn-save-cuts-next">حفظ ومتابعة</button>
         </div>
       </div>
@@ -1487,6 +1638,7 @@
       </section>
 
       ${statsStripHtml}
+      ${capcutTrackHtml}
 
       ${p.audio_path ? `
         <div class="audio-bar">
@@ -1597,6 +1749,28 @@
       };
     });
 
+    const sliceNowBtn = document.getElementById("btn-slice-audio-now");
+    if (sliceNowBtn) sliceNowBtn.onclick = () => triggerImmediateAudioSlice(true);
+
+    outlet.querySelectorAll("[data-play-slice]").forEach((card) => {
+      card.onclick = () => {
+        const sid = Number(card.dataset.playSlice);
+        const clip = (p.audio_clips || []).find((c) => Number(c.segment_id) === sid);
+        if (clip && clip.url) {
+          const clipAudio = new Audio(`${clip.url}?t=${Date.now()}`);
+          clipAudio.play().catch(() => {
+            if (audioEl) {
+              audioEl.currentTime = Number(card.dataset.sliceStart) || 0;
+              audioEl.play().catch(() => {});
+            }
+          });
+        } else if (audioEl) {
+          audioEl.currentTime = Number(card.dataset.sliceStart) || 0;
+          audioEl.play().catch(() => {});
+        }
+      };
+    });
+
     // Rematch cuts action
     const doMatchCuts = async () => {
       try {
@@ -1606,7 +1780,10 @@
         state.timeline = res.timeline;
         state.cutsSubTab = "cuts";
         markSaved();
-        toast("تم بناء نقاط القص بنجاح.", "success");
+        if (res.slice_job_id) {
+          triggerImmediateAudioSlice(false);
+        }
+        toast("تم بناء نقاط القص وبدء قص الصوت (المرحلة 1).", "success");
         render();
       } catch (err) {
         toast(err.message, "error");
@@ -1772,7 +1949,7 @@
     document.getElementById("btn-scenes-next").onclick = () => navigate("motion");
   }
 
-  // ---------- Screen 4: Motion Studio ----------
+  // ---------- Screen 4: Motion Studio (Free-Order Non-Blocking + Live Instant Animation + حركة خاطفة) ----------
   function getImageItems() {
     return (state.timeline?.items || []).filter((it) => it.scene_type === "image");
   }
@@ -1781,15 +1958,107 @@
     return MOTION_TABS.findIndex((t) => t.id === tabId);
   }
 
-  function getEligibleImagesForTab(tabId) {
-    const imgs = getImageItems();
-    const tabIdx = getTabIndex(tabId);
-    const assignments = state.motions.assignments || {};
-    return imgs.filter((it) => {
-      const a = assignments[String(it.segment_id)];
-      if (!a || !a.type) return true;
-      return getTabIndex(a.type) >= tabIdx;
-    });
+  // Non-blocking: all image scenes remain accessible in any tab and any order (no forced redirect)
+  function getEligibleImagesForTab(_tabId) {
+    return getImageItems();
+  }
+
+  function stopLiveMotionPreview() {
+    if (state.liveAnimRaf) {
+      cancelAnimationFrame(state.liveAnimRaf);
+      state.liveAnimRaf = null;
+    }
+    state.liveAnimatingSegId = null;
+    const imgEl = document.getElementById("stage-preview-img");
+    if (imgEl) {
+      imgEl.style.transform = "none";
+      imgEl.style.transformOrigin = "50% 50%";
+    }
+    const hud = document.getElementById("live-anim-hud");
+    if (hud) hud.classList.add("hidden");
+  }
+
+  function playLiveMotionPreview(segId, motionCfg, durationSec) {
+    stopLiveMotionPreview();
+    const imgEl = document.getElementById("stage-preview-img");
+    if (!imgEl) return;
+
+    const dir = motionCfg?.type || state.motionTab || "zoom_in";
+    const fx = Math.max(0, Math.min(1, Number(motionCfg?.x ?? 0.5)));
+    const fy = Math.max(0, Math.min(1, Number(motionCfg?.y ?? 0.5)));
+    const strengthPct = Math.max(5, Math.min(45, Number(motionCfg?.strength ?? state.motions.global_strength ?? 15)));
+    const durMs = Math.max(1500, Math.min(6000, Number(durationSec || 3.5) * 1000));
+    const maxScale = dir === "snap_zoom"
+      ? 1 + Math.min(0.85, (strengthPct / 100) * 2.2)
+      : 1 + Math.min(0.6, (strengthPct / 100) * 1.6);
+
+    state.liveAnimatingSegId = segId;
+    const hud = document.getElementById("live-anim-hud");
+    const hudTxt = document.getElementById("live-anim-label");
+    if (hud && hudTxt) {
+      const mMeta = MOTION_TABS.find((t) => t.id === dir);
+      hudTxt.textContent = `${mMeta ? mMeta.icon + " " + mMeta.label : dir} · ${(durMs / 1000).toFixed(1)}s`;
+      hud.classList.remove("hidden");
+    }
+
+    const startTs = performance.now();
+    const smoothstep = (t) => t * t * (3 - 2 * t);
+    const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+
+    const tick = (now) => {
+      const elapsed = now - startTs;
+      const p = Math.min(1, elapsed / durMs);
+      let s = 1;
+      let tx = 0;
+      let ty = 0;
+
+      if (dir === "snap_zoom") {
+        // Fast punch-in over first ~0.55s then gentle hold/zoom
+        const snapRatio = Math.min(0.4, 550 / durMs);
+        const e = p <= snapRatio
+          ? 0.92 * easeOutCubic(p / snapRatio)
+          : 0.92 + 0.08 * smoothstep((p - snapRatio) / Math.max(0.01, 1 - snapRatio));
+        s = 1 + (maxScale - 1) * e;
+        imgEl.style.transformOrigin = `${(fx * 100).toFixed(1)}% ${(fy * 100).toFixed(1)}%`;
+      } else if (dir === "zoom_in") {
+        const e = motionCfg?.ease === false ? p : smoothstep(p);
+        s = 1 + (maxScale - 1) * e;
+        imgEl.style.transformOrigin = `${(fx * 100).toFixed(1)}% ${(fy * 100).toFixed(1)}%`;
+      } else if (dir === "zoom_out") {
+        const e = motionCfg?.ease === false ? p : smoothstep(p);
+        s = maxScale - (maxScale - 1) * e;
+        imgEl.style.transformOrigin = `${(fx * 100).toFixed(1)}% ${(fy * 100).toFixed(1)}%`;
+      } else if (dir === "left") {
+        const e = motionCfg?.ease === false ? p : smoothstep(p);
+        s = 1.18;
+        tx = (0.5 - e) * 10;
+        imgEl.style.transformOrigin = `50% ${(fy * 100).toFixed(1)}%`;
+      } else {
+        const e = motionCfg?.ease === false ? p : smoothstep(p);
+        s = 1.18;
+        tx = (-0.5 + e) * 10;
+        imgEl.style.transformOrigin = `50% ${(fy * 100).toFixed(1)}%`;
+      }
+
+      imgEl.style.transform = `translate3d(${tx.toFixed(2)}%, ${ty.toFixed(2)}%, 0) scale(${s.toFixed(4)})`;
+
+      if (p < 1 && state.liveAnimatingSegId === segId) {
+        state.liveAnimRaf = requestAnimationFrame(tick);
+      } else {
+        state.liveAnimRaf = null;
+        state.liveAnimatingSegId = null;
+        setTimeout(() => {
+          const curImg = document.getElementById("stage-preview-img");
+          if (curImg && !state.liveAnimatingSegId) {
+            curImg.style.transform = "none";
+          }
+          const h = document.getElementById("live-anim-hud");
+          if (h && !state.liveAnimatingSegId) h.classList.add("hidden");
+        }, 450);
+      }
+    };
+
+    state.liveAnimRaf = requestAnimationFrame(tick);
   }
 
   async function saveMotionsNow() {
@@ -1803,6 +2072,7 @@
   }
 
   function renderMotion(outlet) {
+    stopLiveMotionPreview();
     const p = state.project;
     const allImages = getImageItems();
     if (!allImages.length) {
@@ -1819,7 +2089,8 @@
 
     const assignments = state.motions.assignments || {};
     const globalStrength = Number(state.motions.global_strength ?? 15);
-    const eligible = getEligibleImagesForTab(state.motionTab);
+    const defaultDur = Number(p.settings?.default_motion_duration ?? 3.5);
+    const eligible = allImages;
 
     let currIdx = eligible.findIndex((x) => Number(x.segment_id) === Number(state.motionCurrentSegId));
     if (currIdx === -1 && eligible.length > 0) {
@@ -1828,28 +2099,28 @@
     }
     const currItem = currIdx >= 0 ? eligible[currIdx] : null;
     const currAssign = currItem ? assignments[String(currItem.segment_id)] : null;
-    const isAssignedInThisTab = currAssign && currAssign.type === state.motionTab;
+    const currDur = Number(currAssign?.duration ?? defaultDur);
 
     const tabsHtml = MOTION_TABS.map((t) => {
       const countInTab = allImages.filter((it) => assignments[String(it.segment_id)]?.type === t.id).length;
-      const eligCount = getEligibleImagesForTab(t.id).length;
       return `<button class="seg-tab ${state.motionTab === t.id ? "active" : ""}" data-mtab="${t.id}">
         <span>${t.icon}</span>
         <span>${t.label}</span>
-        <span class="tabular" style="opacity:0.85">${countInTab}/${eligCount}</span>
+        <span class="tabular" style="opacity:0.85">${countInTab}/${allImages.length}</span>
       </button>`;
     }).join("");
 
     const currTabIdx = getTabIndex(state.motionTab);
     const hasNextTab = currTabIdx < MOTION_TABS.length - 1;
+    const animatedCount = allImages.filter((it) => Boolean(assignments[String(it.segment_id)]?.type)).length;
 
     outlet.innerHTML = `
       <div class="section-header">
         <div>
-          <h1 class="section-title">4. حركات الصور (نقرة واحدة على نقطة التركيز)</h1>
-          <p class="section-subtitle">انقر في أي مكان على الصورة لوضع النقطة الزرقاء. الصور التي تأخذ حركة لا تظهر في التبويبات التالية.</p>
+          <h1 class="section-title">4. استوديو الحركات — حرية كاملة بدون ترتيب (<span class="tabular">${animatedCount}/${allImages.length}</span> متحرك)</h1>
+          <p class="section-subtitle">انتقل لأي مشهد مباشرة (مثل #22) بدون أي إجبار. انقر على الصورة لوضع النقطة الزرقاء ثم اضغط «تحريك المشهد» للمعاينة الفورية.</p>
         </div>
-        <div style="display:flex;gap:10px">
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
           ${hasNextTab ? `<button class="btn" id="btn-next-motion-tab">التالي: ${MOTION_TABS[currTabIdx + 1].label} ←</button>` : ""}
           <button class="btn btn-primary btn-lg" id="btn-motion-export">تنفيذ الحركات والتصدير</button>
         </div>
@@ -1859,9 +2130,14 @@
         <div class="segmented-tabs" role="tablist">${tabsHtml}</div>
         <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
           <label style="display:flex;align-items:center;gap:8px;font-size:13px">
-            <span>قوة الحركة العامة:</span>
+            <span>قوة الحركة:</span>
             <input type="range" id="global-strength-slider" min="5" max="40" step="1" value="${globalStrength}" />
             <span class="tabular mono" id="global-strength-val">${globalStrength}%</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px">
+            <span>مدة الحركة:</span>
+            <input type="range" id="item-duration-slider" min="2" max="6" step="0.5" value="${currDur.toFixed(1)}" />
+            <span class="tabular mono" id="item-duration-val">${currDur.toFixed(1)}s</span>
           </label>
         </div>
       </div>
@@ -1874,22 +2150,25 @@
             <span>مشهد <strong class="tabular">#${currItem.segment_id}</strong></span>
             <span>·</span>
             <span class="mono">${Number(currItem.duration).toFixed(1)}s</span>
+            ${currAssign?.type ? `<span class="conf-badge conf-high">${MOTION_TABS.find((t) => t.id === currAssign.type)?.icon || ""} ${esc(MOTION_TABS.find((t) => t.id === currAssign.type)?.label || currAssign.type)}</span>` : `<span class="conf-badge conf-mid">بدون حركة بعد</span>`}
           </div>
 
-          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-            ${isAssignedInThisTab ? `
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-sm btn-primary" id="btn-animate-scene-now">▶ تحريك المشهد</button>
+            <button class="btn btn-sm" id="btn-snap-zoom-now" title="تطبيق حركة خاطفة سريعة على النقطة المحددة">⚡ حركة خاطفة</button>
+            ${currAssign ? `
               <label style="display:flex;align-items:center;gap:6px;font-size:13px">
-                <span>قوة هذه الصورة:</span>
+                <span>القوة:</span>
                 <input type="range" id="item-strength-slider" min="5" max="40" step="1" value="${Number(currAssign.strength ?? globalStrength)}" />
                 <span class="tabular mono" id="item-strength-val">${Number(currAssign.strength ?? globalStrength)}%</span>
               </label>
               <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
                 <input type="checkbox" id="item-ease-toggle" ${currAssign.ease !== false ? "checked" : ""} />
-                <span>تخفيف الحركة (Ease)</span>
+                <span>تخفيف (Ease)</span>
               </label>
-              <button class="btn btn-sm" id="btn-preview-motion">معاينة الحركة</button>
+              <button class="btn btn-sm" id="btn-preview-motion">تصيير MP4</button>
               <button class="btn btn-sm btn-danger" id="btn-clear-dot">مسح النقطة</button>
-            ` : `<span style="font-size:13px;color:var(--text-2)">انقر على الصورة لتعيين حركة ${esc(state.motionTab)} أو انتقل للتالية لتركها ثابتة</span>`}
+            ` : `<span style="font-size:12.5px;color:var(--text-2)">انقر على الصورة لوضع النقطة الزرقاء ثم حرّك المشهد</span>`}
           </div>
         </div>
 
@@ -1908,8 +2187,12 @@
               </div>
             ` : `
               <div class="stage-image-box" id="stage-image-box">
-                <img src="/api/projects/${esc(p.id)}/scene-file/${currItem.segment_id}" alt="مشهد ${currItem.segment_id}" />
-                ${isAssignedInThisTab ? `
+                <img id="stage-preview-img" src="/api/projects/${esc(p.id)}/scene-file/${currItem.segment_id}" alt="مشهد ${currItem.segment_id}" />
+                <div id="live-anim-hud" class="live-anim-hud hidden">
+                  <span>● تشغيل حي</span>
+                  <span id="live-anim-label" class="mono"></span>
+                </div>
+                ${currAssign ? `
                   <div class="focus-dot" id="focus-dot" style="left:${(currAssign.x * 100).toFixed(2)}%;top:${(currAssign.y * 100).toFixed(2)}%" title="اسحب لتحريك النقطة أو انقر عليها للحذف"></div>
                 ` : ""}
               </div>
@@ -1920,40 +2203,44 @@
             <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="15 18 9 12 15 6"/></svg>
           </button>
         </div>
-      ` : `
-        <div class="empty-state" style="margin-bottom:16px">
-          <h3>تم تعيين حركات لجميع الصور في التبويبات السابقة ✓</h3>
-          <p style="color:var(--text-2);margin-bottom:14px">يمكنك الضغط على أي صورة في الشريط أدناه لتعديل حركتها أو الضغط على تنفيذ الحركات والتصدير.</p>
-        </div>
-      `}
+      ` : ""}
 
       <div class="thumb-strip" id="motion-thumb-strip">
         ${allImages.map((it) => {
           const a = assignments[String(it.segment_id)];
           const tabMeta = a ? MOTION_TABS.find((t) => t.id === a.type) : null;
           const isActive = currItem && Number(currItem.segment_id) === Number(it.segment_id);
-          return `<div class="strip-item ${isActive ? "active" : ""}" data-strip-seg="${it.segment_id}" title="مشهد #${it.segment_id}">
+          return `<div class="strip-item ${isActive ? "active" : ""} ${tabMeta ? "is-animated" : ""}" data-strip-seg="${it.segment_id}" title="مشهد #${it.segment_id}">
             <img src="${esc(it.thumbnail_url || `/api/projects/${p.id}/scene-file/${it.segment_id}`)}" alt="#${it.segment_id}" />
-            <span class="strip-badge ${tabMeta ? "assigned" : ""}">#${it.segment_id} ${tabMeta ? tabMeta.icon : ""}</span>
+            <span class="strip-badge ${tabMeta ? "animated" : ""}">#${it.segment_id} ${tabMeta ? `✓ ${tabMeta.icon}` : "•"}</span>
           </div>`;
         }).join("")}
       </div>
 
       <div class="shortcut-bar">
-        <span>اختصارات لوحة المفاتيح:</span>
+        <span>اختصارات:</span>
         <span><span class="kbd">←</span> / <span class="kbd">Enter</span> التالية</span>
         <span><span class="kbd">→</span> السابقة</span>
+        <span><span class="kbd">Space</span> تحريك المشهد</span>
         <span><span class="kbd">Delete</span> مسح النقطة</span>
-        <span><span class="kbd">S</span> تخطي</span>
         <span><span class="kbd">Z</span> تراجع</span>
-        <span><span class="kbd">1-4</span> تبديل التبويب</span>
+        <span><span class="kbd">1-5</span> نوع الحركة</span>
       </div>
     `;
+
+    // Smooth auto-scroll bottom timeline strip so active scene is always centered/visible
+    const activeStripEl = outlet.querySelector(`[data-strip-seg="${state.motionCurrentSegId}"]`);
+    if (activeStripEl && activeStripEl.scrollIntoView) {
+      requestAnimationFrame(() => {
+        activeStripEl.scrollIntoView({ behavior: "smooth", inline: "center", block: "nearest" });
+      });
+    }
 
     outlet.querySelectorAll("[data-mtab]").forEach((btn) => {
       btn.onclick = () => {
         state.motionTab = btn.dataset.mtab;
         state.previewVideoUrl = null;
+        // Keep current image selected — never jump back!
         render();
       };
     });
@@ -1981,9 +2268,7 @@
       el.onclick = () => {
         const sid = Number(el.dataset.stripSeg);
         const a = assignments[String(sid)];
-        if (a && a.type && getTabIndex(a.type) < getTabIndex(state.motionTab)) {
-          state.motionTab = a.type;
-        }
+        if (a && a.type) state.motionTab = a.type;
         state.motionCurrentSegId = sid;
         state.previewVideoUrl = null;
         render();
@@ -1992,6 +2277,21 @@
 
     if (currItem) {
       const sidKey = String(currItem.segment_id);
+
+      const durSlider = document.getElementById("item-duration-slider");
+      if (durSlider) {
+        durSlider.oninput = () => {
+          const val = Number(durSlider.value);
+          document.getElementById("item-duration-val").textContent = `${val.toFixed(1)}s`;
+          if (assignments[sidKey]) {
+            assignments[sidKey].duration = val;
+          }
+        };
+        durSlider.onchange = async () => {
+          if (assignments[sidKey]) await saveMotionsNow();
+        };
+      }
+
       const goPrev = () => {
         if (currIdx > 0) {
           state.motionCurrentSegId = eligible[currIdx - 1].segment_id;
@@ -2009,6 +2309,49 @@
 
       document.getElementById("btn-prev-img").onclick = goPrev;
       document.getElementById("btn-next-img").onclick = goNext;
+
+      const animateNowBtn = document.getElementById("btn-animate-scene-now");
+      if (animateNowBtn) {
+        animateNowBtn.onclick = async () => {
+          const dVal = Number(durSlider?.value || defaultDur);
+          if (!assignments[sidKey]) {
+            assignments[sidKey] = {
+              type: state.motionTab || "zoom_in",
+              x: 0.5,
+              y: 0.5,
+              strength: globalStrength,
+              ease: true,
+              duration: dVal,
+            };
+            state.motions.assignments = assignments;
+            await saveMotionsNow();
+            render();
+          }
+          playLiveMotionPreview(currItem.segment_id, assignments[sidKey], dVal);
+        };
+      }
+
+      const snapZoomBtn = document.getElementById("btn-snap-zoom-now");
+      if (snapZoomBtn) {
+        snapZoomBtn.onclick = async () => {
+          const prevCfg = assignments[sidKey];
+          state.motionHistory.push({ sidKey, prev: prevCfg ? { ...prevCfg } : null });
+          const dVal = Number(durSlider?.value || defaultDur);
+          assignments[sidKey] = {
+            type: "snap_zoom",
+            x: prevCfg?.x ?? 0.5,
+            y: prevCfg?.y ?? 0.5,
+            strength: prevCfg?.strength ?? Math.max(globalStrength, 18),
+            ease: true,
+            duration: dVal,
+          };
+          state.motions.assignments = assignments;
+          state.motionTab = "snap_zoom";
+          await saveMotionsNow();
+          render();
+          playLiveMotionPreview(currItem.segment_id, assignments[sidKey], dVal);
+        };
+      }
 
       const closePrevBtn = document.getElementById("btn-close-preview");
       if (closePrevBtn) {
@@ -2042,6 +2385,7 @@
             y: Number(ny.toFixed(4)),
             strength: existing.strength ?? null,
             ease: existing.ease !== false,
+            duration: existing.duration ?? Number(durSlider?.value || defaultDur),
           };
           state.motions.assignments = assignments;
         };
@@ -2116,19 +2460,20 @@
       if (prevBtn) {
         prevBtn.onclick = async () => {
           prevBtn.disabled = true;
-          prevBtn.textContent = "جاري تجهيز المعاينة...";
+          prevBtn.textContent = "جاري تجهيز MP4...";
           try {
             const res = await apiJson(`/api/projects/${p.id}/motions/preview`, "POST", {
               segment_id: currItem.segment_id,
               motion: assignments[sidKey],
               global_strength: globalStrength,
+              duration: Number(durSlider?.value || defaultDur),
             });
             state.previewVideoUrl = res.preview_url;
             render();
           } catch (err) {
             toast(err.message, "error");
             prevBtn.disabled = false;
-            prevBtn.textContent = "معاينة الحركة";
+            prevBtn.textContent = "تصيير MP4";
           }
         };
       }
@@ -2158,6 +2503,9 @@
         state.previewVideoUrl = null;
         render();
       }
+    } else if (e.key === " ") {
+      e.preventDefault();
+      document.getElementById("btn-animate-scene-now")?.click();
     } else if (e.key === "Delete" || e.key === "Backspace") {
       if (currItem && assignments[String(currItem.segment_id)]) {
         e.preventDefault();
@@ -2175,7 +2523,7 @@
         render();
         await saveMotionsNow();
       }
-    } else if (["1", "2", "3", "4"].includes(e.key)) {
+    } else if (["1", "2", "3", "4", "5"].includes(e.key)) {
       state.motionTab = MOTION_TABS[Number(e.key) - 1].id;
       state.previewVideoUrl = null;
       render();
@@ -2286,8 +2634,50 @@
       ` : ""}
 
       ${clipGridHtml}
+      ${items.length ? `
+        <div class="card" style="margin-bottom:20px">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px">
+            <div>
+              <h2 class="card-title" style="margin:0">المرحلة 2: تصدير كل مشهد بشكل مستقل</h2>
+              <div class="field-hint" style="margin-top:2px">يمكنك تصدير أو إعادة تصدير أي مشهد بمفرده مع صوته المقصوص دون التأثير على باقي المشاهد.</div>
+            </div>
+            <span class="conf-badge conf-high">الوضع: ${esc(RESOURCE_MODES[p.settings?.resource_mode || "light"] || "خفيف")}</span>
+          </div>
+          <div class="clip-progress-grid">
+            ${items.map((it) => {
+              const outUrl = state.sceneOutputs[it.segment_id];
+              return `<div class="clip-pill ${outUrl ? "done" : ""}" style="flex-direction:column;align-items:stretch;gap:6px">
+                <div style="display:flex;justify-content:space-between;align-items:center">
+                  <strong class="tabular">#${it.segment_id}</strong>
+                  <span class="mono" style="font-size:11px">${Number(it.duration).toFixed(1)}s</span>
+                </div>
+                <button class="btn btn-sm" data-export-scene="${it.segment_id}">تصدير مشهد</button>
+                ${outUrl ? `<a class="btn btn-sm btn-primary" href="${esc(outUrl)}" target="_blank" style="text-align:center;text-decoration:none">فتح/تشغيل</a>` : ""}
+              </div>`;
+            }).join("")}
+          </div>
+        </div>
+      ` : ""}
       ${reportHtml}
     `;
+
+    outlet.querySelectorAll("[data-export-scene]").forEach((btn) => {
+      btn.onclick = async () => {
+        const sid = Number(btn.dataset.exportScene);
+        btn.disabled = true;
+        btn.textContent = "جاري التصيير...";
+        try {
+          const res = await apiJson(`/api/projects/${p.id}/export-scene/${sid}`, "POST", {});
+          state.sceneOutputs[sid] = `${res.url}?t=${Date.now()}`;
+          toast(`تم تصدير المشهد #${sid} بنجاح!`, "success");
+          render();
+        } catch (err) {
+          toast(err.message, "error");
+          btn.disabled = false;
+          btn.textContent = "تصدير مشهد";
+        }
+      };
+    });
 
     const startBtn = document.getElementById("btn-start-export-now");
     if (startBtn) startBtn.onclick = triggerExport;
@@ -2455,7 +2845,7 @@
     document.getElementById("btn-review-rebuild").onclick = triggerExport;
   }
 
-  // ---------- Settings Modal (Zero Whisper settings, includes 3 Themes) ----------
+  // ---------- Settings Modal (Zero Whisper settings, includes 3 Themes & Resource Throttling) ----------
   function openSettingsModal() {
     const s = state.project?.settings || state.globalSettings?.defaults || {
       resolution: "1920x1080",
@@ -2463,14 +2853,27 @@
       background_fill: "blurred",
       slowmo_smooth: "off",
       default_motion_strength: 15,
+      default_motion_duration: 3.5,
+      resource_mode: "light",
+      auto_slice_audio: true,
       theme: state.theme,
     };
     const currTheme = normalizeTheme(s.theme || state.theme);
+    let selectedResMode = s.resource_mode || "light";
 
     openModal(`
       <div class="modal-header">
-        <h3 style="margin:0;font-size:18px">إعدادات المشروع والمظهر</h3>
+        <h3 style="margin:0;font-size:18px">إعدادات المشروع والاستهلاك</h3>
         <button class="btn btn-sm btn-ghost" id="set-close">✕</button>
+      </div>
+      <div class="field">
+        <label class="field-label">مستوى استهلاك الجهاز (حماية الحرارة والرامات للفيديوهات 45–60 دقيقة)</label>
+        <div class="resource-mode-group" id="set-resource-group">
+          <button type="button" class="resource-mode-btn ${selectedResMode === "light" ? "active" : ""}" data-rmode="light">خفيف (افتراضي)</button>
+          <button type="button" class="resource-mode-btn ${selectedResMode === "medium" ? "active" : ""}" data-rmode="medium">متوسط</button>
+          <button type="button" class="resource-mode-btn ${selectedResMode === "fast" ? "active" : ""}" data-rmode="fast">سريع</button>
+        </div>
+        <div class="field-hint">«خفيف» يحدد خيوط المعالج والذاكرة مع فواصل تبريد؛ في المتصفح تدار المعالجة على دفعات صغيرة دون قيود نظام مباشرة.</div>
       </div>
       <div class="field">
         <label class="field-label">المظهر العام (Themes)</label>
@@ -2496,9 +2899,15 @@
           <option value="60" ${Number(s.fps) === 60 ? "selected" : ""}>60 fps</option>
         </select>
       </div>
-      <div class="field">
-        <label class="field-label">قوة الحركة الافتراضية للصور (%)</label>
-        <input class="input tabular" type="number" min="5" max="40" id="set-motion-strength" value="${Number(s.default_motion_strength ?? 15)}" />
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="field">
+          <label class="field-label">قوة الحركة الافتراضية (%)</label>
+          <input class="input tabular" type="number" min="5" max="40" id="set-motion-strength" value="${Number(s.default_motion_strength ?? 15)}" />
+        </div>
+        <div class="field">
+          <label class="field-label">مدة الحركة الافتراضية (ث)</label>
+          <input class="input tabular" type="number" min="2" max="6" step="0.5" id="set-motion-duration" value="${Number(s.default_motion_duration ?? 3.5)}" />
+        </div>
       </div>
       <div class="field">
         <label class="field-label">ملء الخلفية عند اختلاف الأبعاد</label>
@@ -2515,11 +2924,24 @@
           <option value="mci" ${s.slowmo_smooth === "mci" ? "selected" : ""}>MCI (جودة عالية جداً — بطيء على CPU)</option>
         </select>
       </div>
+      <div class="field">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13.5px">
+          <input type="checkbox" id="set-auto-slice" ${s.auto_slice_audio !== false ? "checked" : ""} />
+          <span>قص الصوت تلقائياً وفورياً بمجرد إتمام نقاط القص (المرحلة 1)</span>
+        </label>
+      </div>
       <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px">
         <button class="btn" id="set-cancel">إلغاء</button>
         <button class="btn btn-primary" id="set-save">حفظ الإعدادات</button>
       </div>
     `);
+
+    document.querySelectorAll("[data-rmode]").forEach((btn) => {
+      btn.onclick = () => {
+        selectedResMode = btn.dataset.rmode;
+        document.querySelectorAll("[data-rmode]").forEach((b) => b.classList.toggle("active", b.dataset.rmode === selectedResMode));
+      };
+    });
 
     document.getElementById("set-close").onclick = closeModal;
     document.getElementById("set-cancel").onclick = closeModal;
@@ -2528,13 +2950,17 @@
       const nextTheme = normalizeTheme(document.getElementById("set-theme").value);
       const nextSettings = {
         theme: nextTheme,
+        resource_mode: selectedResMode,
         resolution: document.getElementById("set-res").value,
         fps: Number(document.getElementById("set-fps").value),
         default_motion_strength: Math.max(5, Math.min(40, Number(document.getElementById("set-motion-strength").value) || 15)),
+        default_motion_duration: Math.max(2, Math.min(6, Number(document.getElementById("set-motion-duration").value) || 3.5)),
         background_fill: document.getElementById("set-bg").value,
         slowmo_smooth: document.getElementById("set-slowmo").value,
+        auto_slice_audio: document.getElementById("set-auto-slice").checked,
       };
       await applyTheme(nextTheme, true);
+      await apiJson("/api/settings/global", "PUT", { defaults: nextSettings }).catch(() => {});
       if (state.project) {
         const res = await apiJson(`/api/projects/${state.project.id}`, "PATCH", { settings: nextSettings });
         state.project = res.project;
@@ -3122,6 +3548,21 @@
     document.getElementById("btn-open-log").onclick = openLog;
     document.getElementById("btn-banner-log").onclick = openLog;
 
+    const pauseJobBtn = document.getElementById("btn-pause-job");
+    if (pauseJobBtn) {
+      pauseJobBtn.onclick = async () => {
+        if (!state.activeJob?.id) return;
+        const action = state.activeJob.paused ? "resume" : "pause";
+        try {
+          const res = await apiJson(`/api/jobs/${state.activeJob.id}/${action}`, "POST", {});
+          state.activeJob.paused = res.paused;
+          renderLiveBanner();
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      };
+    }
+
     document.getElementById("btn-cancel-job").onclick = async () => {
       if (state.activeJob?.id) {
         await apiJson(`/api/jobs/${state.activeJob.id}/cancel`, "POST", {});
@@ -3133,6 +3574,60 @@
         if (state.project) navigate(btn.dataset.stage);
       };
     });
+
+    // ---------- PWA Install, Service Worker & Online/Offline Status ----------
+    if ("serviceWorker" in navigator && location.protocol !== "file:") {
+      navigator.serviceWorker.register("/sw.js").catch(() => {});
+    }
+
+    const updateOnlineBadge = () => {
+      const el = document.getElementById("offline-indicator");
+      if (el) el.classList.toggle("hidden", navigator.onLine !== false);
+    };
+    window.addEventListener("online", updateOnlineBadge);
+    window.addEventListener("offline", updateOnlineBadge);
+    updateOnlineBadge();
+
+    const installBtn = document.getElementById("btn-install-pwa");
+    const isStandalone = window.matchMedia?.("(display-mode: standalone)")?.matches || window.navigator.standalone === true;
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+    if (installBtn && !isStandalone) {
+      if (isIOS) installBtn.classList.remove("hidden");
+      window.addEventListener("beforeinstallprompt", (e) => {
+        e.preventDefault();
+        state.deferredInstallPrompt = e;
+        installBtn.classList.remove("hidden");
+      });
+      window.addEventListener("appinstalled", () => {
+        state.deferredInstallPrompt = null;
+        installBtn.classList.add("hidden");
+        toast("تم تثبيت تطبيق AutoCut على جهازك بنجاح!", "success");
+      });
+      installBtn.onclick = async () => {
+        if (state.deferredInstallPrompt) {
+          state.deferredInstallPrompt.prompt();
+          const { outcome } = await state.deferredInstallPrompt.userChoice;
+          if (outcome === "accepted") {
+            installBtn.classList.add("hidden");
+          }
+          state.deferredInstallPrompt = null;
+        } else {
+          openModal(`
+            <div class="modal-header">
+              <h3 style="margin:0;font-size:18px">تثبيت تطبيق AutoCut على جهازك</h3>
+              <button class="btn btn-sm btn-ghost" id="pwa-close">✕</button>
+            </div>
+            <p style="color:var(--text-2);margin-top:0">لتثبيت التطبيق كتطبيق مستقل يعمل أوفلاين:</p>
+            <ul class="update-list" style="color:var(--text)">
+              <li>على كمبيوتر (Chrome / Edge): افتح قائمة المتصفح ⋮ ← <strong>Install AutoCut / تثبيت التطبيق</strong> (تأكد أنك تفتحه عبر <span class="mono">http://127.0.0.1:8000</span> وليس <span class="mono">file://</span>).</li>
+              <li>على iPhone / iPad (Safari): اضغط أيقونة المشاركة ثم <strong>Add to Home Screen</strong>.</li>
+            </ul>
+          `);
+          document.getElementById("pwa-close").onclick = closeModal;
+        }
+      };
+    }
 
     await loadHealth();
     await loadProjects();

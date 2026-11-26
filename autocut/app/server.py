@@ -39,7 +39,12 @@ from .project import (
     save_project,
     save_transcript,
 )
-from .render import export_timeline_video
+from .render import (
+    export_single_scene_with_audio,
+    export_timeline_video,
+    get_resource_profile,
+    slice_audio_into_clips,
+)
 from .scenes import SUPPORTED_EXTS, scan_scenes_folder
 from .settings_store import (
     build_problem_report,
@@ -74,7 +79,63 @@ app = FastAPI(title="AutoCut Local Server", docs_url=None, redoc_url=None)
 # Background job registry
 _JOBS: Dict[str, Dict[str, Any]] = {}
 _JOB_EVENTS: Dict[str, threading.Event] = {}
+_JOB_PAUSE_EVENTS: Dict[str, threading.Event] = {}
 _JOBS_LOCK = threading.Lock()
+
+
+def _start_audio_slice_job(project_id: str, meta: Dict[str, Any], cuts: Dict[str, Any]) -> Optional[str]:
+    """Launch Stage 1 immediate audio slicing in background and return job_id."""
+    audio_path = meta.get("audio_path")
+    if not audio_path or not Path(audio_path).exists() or not (cuts or {}).get("segments"):
+        return None
+    job_id = f"slice_{uuid.uuid4().hex[:8]}"
+    cancel_ev = threading.Event()
+    pause_ev = threading.Event()
+    segs = cuts.get("segments") or []
+    with _JOBS_LOCK:
+        _JOB_EVENTS[job_id] = cancel_ev
+        _JOB_PAUSE_EVENTS[job_id] = pause_ev
+        _JOBS[job_id] = {
+            "id": job_id,
+            "type": "slice_audio",
+            "stage_num": 1,
+            "paused": False,
+            "status": "running",
+            "progress": 1.0,
+            "elapsed": 0.0,
+            "eta": None,
+            "completed": 0,
+            "total": len(segs),
+            "message": "المرحلة 1: جاري قص الصوت فوراً إلى مقاطع مرقمة...",
+            "clip_states": {int(s["id"]): "waiting" for s in segs},
+            "audio_clips": [],
+            "error": None,
+        }
+
+    def _run_slice() -> None:
+        try:
+            def _on_prog(info: Dict[str, Any]) -> None:
+                _update_job(job_id, **info)
+
+            clips = slice_audio_into_clips(
+                project_id=project_id,
+                audio_path=Path(audio_path),
+                cuts=cuts,
+                settings=meta.get("settings") or {},
+                progress_callback=_on_prog,
+                cancel_event=cancel_ev,
+                pause_event=pause_ev,
+            )
+            save_project(project_id, {"audio_clips": clips})
+            _update_job(job_id, status="done", progress=100.0, audio_clips=clips, message="اكتمل قص جميع المقاطع الصوتية!")
+        except InterruptedError as exc:
+            _update_job(job_id, status="cancelled", error=str(exc), message="تم إيقاف قص الصوت.")
+        except Exception as exc:
+            logger.exception("Audio slicing failed: %s", exc)
+            _update_job(job_id, status="error", error=str(exc), message="تعذر قص المقاطع الصوتية.")
+
+    threading.Thread(target=_run_slice, daemon=True).start()
+    return job_id
 
 
 def check_binaries() -> Dict[str, Any]:
@@ -485,13 +546,50 @@ async def api_match_cuts(project_id: str, payload: Optional[Dict[str, Any]] = No
 
     next_stage = "motion" if auto_mode else "cuts"
     meta = save_project(project_id, {"stage": next_stage})
+
+    slice_job_id = None
+    if meta["settings"].get("auto_slice_audio", True) and meta.get("audio_path"):
+        slice_job_id = _start_audio_slice_job(project_id, meta, cuts)
+
     return {
         "ok": True,
         "project": meta,
         "cuts": cuts,
         "timeline": timeline,
         "scenes_scan": scan,
+        "slice_job_id": slice_job_id,
     }
+
+
+@app.post("/api/projects/{project_id}/slice-audio")
+async def api_slice_audio(project_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Stage 1: Slice narration audio immediately into numbered per-scene audio clips."""
+    payload = payload or {}
+    meta = load_project(project_id)
+    cuts = load_cuts(project_id)
+    if not cuts or not cuts.get("segments"):
+        return JSONResponse(status_code=400, content={"ok": False, "error": "يرجى إتمام مطابقة نقاط القص أولاً قبل قص الصوت."})
+    audio_path = meta.get("audio_path")
+    if not audio_path or not Path(audio_path).exists():
+        return JSONResponse(status_code=400, content={"ok": False, "error": "ملف الصوت غير موجود."})
+
+    if payload.get("sync"):
+        clips = slice_audio_into_clips(project_id, Path(audio_path), cuts, settings=meta.get("settings") or {})
+        meta = save_project(project_id, {"audio_clips": clips})
+        return {"ok": True, "audio_clips": clips, "project": meta}
+
+    job_id = _start_audio_slice_job(project_id, meta, cuts)
+    return {"ok": True, "job_id": job_id}
+
+
+@app.get("/api/projects/{project_id}/audio-clips/{seg_id}")
+def api_get_audio_clip(project_id: str, seg_id: int):
+    pdir = get_project_dir(project_id)
+    clips_dir = pdir / "audio_clips"
+    matches = sorted(clips_dir.glob(f"clip_{int(seg_id)}_*.m4a"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="المقطع الصوتي غير مقصوص بعد.")
+    return FileResponse(matches[-1], media_type="audio/mp4", filename=f"clip_{int(seg_id)}.m4a")
 
 
 @app.post("/api/projects/{project_id}/quick-folder")
@@ -631,7 +729,36 @@ def api_cancel_job(job_id: str) -> Dict[str, Any]:
         ev = _JOB_EVENTS.get(job_id)
         if ev:
             ev.set()
+        pev = _JOB_PAUSE_EVENTS.get(job_id)
+        if pev:
+            pev.clear()
     return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/pause")
+def api_pause_job(job_id: str) -> Dict[str, Any]:
+    with _JOBS_LOCK:
+        pev = _JOB_PAUSE_EVENTS.get(job_id)
+        if not pev:
+            raise HTTPException(status_code=404, detail="المهمة غير موجودة.")
+        pev.set()
+        if job_id in _JOBS:
+            _JOBS[job_id]["paused"] = True
+            _JOBS[job_id]["message"] = "تم الإيقاف المؤقت — اضغط استئناف للمتابعة"
+    return {"ok": True, "paused": True}
+
+
+@app.post("/api/jobs/{job_id}/resume")
+def api_resume_job(job_id: str) -> Dict[str, Any]:
+    with _JOBS_LOCK:
+        pev = _JOB_PAUSE_EVENTS.get(job_id)
+        if not pev:
+            raise HTTPException(status_code=404, detail="المهمة غير موجودة.")
+        pev.clear()
+        if job_id in _JOBS:
+            _JOBS[job_id]["paused"] = False
+            _JOBS[job_id]["message"] = "جاري استئناف المعالجة..."
+    return {"ok": True, "paused": False}
 
 
 @app.put("/api/projects/{project_id}/cuts")
@@ -689,11 +816,15 @@ async def api_save_motions(project_id: str, payload: Dict[str, Any]) -> Dict[str
 
 @app.post("/api/projects/{project_id}/motions/preview")
 async def api_preview_motion(project_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Render a fast 480p 2.5s preview MP4 for the selected image motion."""
+    """Render a fast 480p preview MP4 for the selected image motion (3-4s default duration)."""
     meta = load_project(project_id)
     seg_id = int(payload["segment_id"])
     motion = payload.get("motion")
     global_strength = float(payload.get("global_strength", 15))
+    dur_s = float(payload.get("duration") or meta["settings"].get("default_motion_duration", 3.5))
+    dur_s = max(1.5, min(6.0, dur_s))
+    preview_fps = 24
+    frame_count = max(24, int(round(dur_s * preview_fps)))
 
     overrides = meta.get("overrides") or {}
     scenes_map = (meta.get("scenes_scan") or {}).get("scenes") or {}
@@ -707,21 +838,59 @@ async def api_preview_motion(project_id: str, payload: Dict[str, Any]) -> Dict[s
     for old in (pdir / "previews").glob(f"preview_{seg_id}_*.mp4"):
         old.unlink(missing_ok=True)
 
+    prof = get_resource_profile(meta.get("settings"))
     render_image_motion_clip(
         src_image=Path(scene["path"]),
         out_clip=out_mp4,
-        frame_count=60,
+        frame_count=frame_count,
         width=854,
         height=480,
-        fps=24,
+        fps=preview_fps,
         background_fill=meta["settings"].get("background_fill", "blurred"),
         motion=motion,
         global_strength=global_strength,
+        ffmpeg_threads=prof["ffmpeg_threads"] or None,
     )
     return {
         "ok": True,
         "preview_url": f"/api/projects/{project_id}/previews/{preview_name}",
     }
+
+
+@app.post("/api/projects/{project_id}/export-scene/{seg_id}")
+async def api_export_single_scene(project_id: str, seg_id: int) -> Dict[str, Any]:
+    """Stage 2 independent per-scene export: render and mux just one scene with its audio slice."""
+    meta = load_project(project_id)
+    cuts = load_cuts(project_id)
+    if not cuts:
+        return JSONResponse(status_code=400, content={"ok": False, "error": "يرجى إتمام مرحلة القص أولاً."})
+    audio_path = meta.get("audio_path")
+    if not audio_path or not Path(audio_path).exists():
+        return JSONResponse(status_code=400, content={"ok": False, "error": "ملف الصوت غير موجود."})
+
+    scenes_map = (meta.get("scenes_scan") or {}).get("scenes") or {}
+    timeline = build_timeline(
+        cuts,
+        scenes_map,
+        fps=int(meta["settings"].get("fps", 30)),
+        overrides=meta.get("overrides") or {},
+    )
+    item = next((it for it in timeline["items"] if int(it["segment_id"]) == int(seg_id)), None)
+    if not item:
+        raise HTTPException(status_code=404, detail="المشهد غير موجود في الخط الزمني.")
+
+    motions = load_motions(project_id)
+    motion = (motions.get("assignments") or {}).get(str(seg_id)) if item["scene_type"] == "image" else None
+    global_strength = float(motions.get("global_strength", meta["settings"].get("default_motion_strength", 15)))
+    res = export_single_scene_with_audio(
+        project_id=project_id,
+        item=item,
+        audio_path=Path(audio_path),
+        settings=meta["settings"],
+        motion=motion,
+        global_strength=global_strength,
+    )
+    return res
 
 
 @app.post("/api/projects/{project_id}/export")
@@ -746,11 +915,15 @@ async def api_start_export(project_id: str) -> Dict[str, Any]:
 
     job_id = uuid.uuid4().hex[:10]
     cancel_ev = threading.Event()
+    pause_ev = threading.Event()
     with _JOBS_LOCK:
         _JOB_EVENTS[job_id] = cancel_ev
+        _JOB_PAUSE_EVENTS[job_id] = pause_ev
         _JOBS[job_id] = {
             "id": job_id,
             "type": "export",
+            "stage_num": 2,
+            "paused": False,
             "status": "running",
             "progress": 0.0,
             "elapsed": 0.0,
@@ -774,6 +947,7 @@ async def api_start_export(project_id: str) -> Dict[str, Any]:
                 motions_data=motions,
                 progress_callback=_on_prog,
                 cancel_event=cancel_ev,
+                pause_event=pause_ev,
             )
             save_project(project_id, {"stage": "export", "export_report": report})
             _update_job(job_id, status="done", progress=100.0, report=report, message="اكتمل التصدير بنجاح!")
@@ -798,6 +972,16 @@ def api_get_output_video(project_id: str):
     out = pdir / "output" / "final.mp4"
     if not out.exists():
         raise HTTPException(status_code=404, detail="الفيديو النهائي غير موجود بعد.")
+    return FileResponse(out, media_type="video/mp4")
+
+
+@app.get("/api/projects/{project_id}/output/{filename}")
+def api_get_scene_output_video(project_id: str, filename: str):
+    pdir = get_project_dir(project_id)
+    safe_name = Path(filename).name
+    out = pdir / "output" / safe_name
+    if not out.exists():
+        raise HTTPException(status_code=404, detail="ملف المخرجات غير موجود.")
     return FileResponse(out, media_type="video/mp4")
 
 
@@ -1069,6 +1253,46 @@ def api_updates_ack_result() -> Dict[str, Any]:
     if res_file.exists():
         res_file.unlink(missing_ok=True)
     return {"ok": True}
+
+
+# PWA endpoints for offline installable localhost app
+@app.get("/manifest.json")
+def pwa_manifest():
+    return FileResponse(WEB_DIR / "manifest.json", media_type="application/manifest+json")
+
+
+@app.get("/sw.js")
+def pwa_service_worker():
+    return FileResponse(
+        WEB_DIR / "sw.js",
+        media_type="application/javascript",
+        headers={"Service-Worker-Allowed": "/"},
+    )
+
+
+@app.get("/icon.svg")
+def pwa_icon_svg():
+    return FileResponse(WEB_DIR / "icons" / "icon.svg", media_type="image/svg+xml")
+
+
+@app.get("/pwa-192x192.png")
+def pwa_icon_192():
+    return FileResponse(WEB_DIR / "icons" / "pwa-192x192.png", media_type="image/png")
+
+
+@app.get("/pwa-512x512.png")
+def pwa_icon_512():
+    return FileResponse(WEB_DIR / "icons" / "pwa-512x512.png", media_type="image/png")
+
+
+@app.get("/pwa-maskable-512x512.png")
+def pwa_icon_maskable():
+    return FileResponse(WEB_DIR / "icons" / "pwa-maskable-512x512.png", media_type="image/png")
+
+
+@app.get("/apple-touch-icon.png")
+def pwa_apple_icon():
+    return FileResponse(WEB_DIR / "icons" / "apple-touch-icon.png", media_type="image/png")
 
 
 # Serve static frontend from autocut/web/

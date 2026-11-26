@@ -385,7 +385,7 @@ class V12Tests(unittest.TestCase):
         install_bat = (BASE_DIR / "install.bat").read_text(encoding="utf-8").lower()
         self.assertNotIn("whisper", install_bat)
 
-        self.assertEqual((BASE_DIR / "VERSION").read_text(encoding="utf-8").strip(), "1.2.0")
+        self.assertEqual((BASE_DIR / "VERSION").read_text(encoding="utf-8").strip(), "1.3.0")
         self.assertTrue((BASE_DIR / "settings.example.json").exists())
 
         gitignore = (BASE_DIR.parent / ".gitignore").read_text(encoding="utf-8")
